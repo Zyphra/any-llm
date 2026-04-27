@@ -119,6 +119,24 @@ async def test_completion_with_kwargs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completion_with_stop_sequences_uses_anthropic_kwarg() -> None:
+    api_key = "test-api-key"
+    model = "model-id"
+    messages = [{"role": "user", "content": "Hello"}]
+
+    with mock_anthropic_provider() as mock_anthropic:
+        provider = AnthropicProvider(api_key=api_key)
+        await provider._acompletion(CompletionParams(model_id=model, messages=messages, stop=["END", "STOP"]))
+
+        mock_anthropic.return_value.messages.create.assert_called_once_with(
+            model=model,
+            messages=messages,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            stop_sequences=["END", "STOP"],
+        )
+
+
+@pytest.mark.asyncio
 async def test_completion_with_tool_choice_required() -> None:
     api_key = "test-api-key"
     model = "model-id"
