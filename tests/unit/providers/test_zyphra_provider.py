@@ -9,7 +9,7 @@ def test_provider_basics() -> None:
     assert provider.PROVIDER_NAME == "zyphra"
     assert provider.ENV_API_KEY_NAME == "ZYPHRA_API_KEY"
     assert provider.ENV_API_BASE_NAME == "ZYPHRA_API_BASE"
-    assert provider.API_BASE == "https://uyppidoc.zyphracloud.com/v1"
+    assert provider.API_BASE == "https://api.zyphracloud.com/api/v1"
 
 
 def test_zyphra_supports_flags() -> None:
@@ -20,7 +20,7 @@ def test_zyphra_supports_flags() -> None:
     assert provider.SUPPORTS_COMPLETION_REASONING is True
     assert provider.SUPPORTS_COMPLETION_IMAGE is False
     assert provider.SUPPORTS_COMPLETION_PDF is False
-    assert provider.SUPPORTS_LIST_MODELS is False
+    assert provider.SUPPORTS_LIST_MODELS is True
 
 
 def test_factory_integration() -> None:
@@ -50,3 +50,38 @@ def test_provider_metadata() -> None:
     assert metadata.env_key == "ZYPHRA_API_KEY"
     assert metadata.env_api_base == "ZYPHRA_API_BASE"
     assert metadata.completion is True
+
+
+def test_zyphra_item_to_model_maps_all_fields() -> None:
+    """Verify the Zyphra /models item shape is mapped to the OpenAI Model contract."""
+    item = {
+        "modelId": "deepseek-ai/DeepSeek-V3.2",
+        "organization": "DeepSeek",
+        "releaseDate": "2025-12-01",
+        "name": "DeepSeek-V3.2",
+    }
+    model = ZyphraProvider._zyphra_item_to_model(item)
+    assert model.id == "deepseek-ai/DeepSeek-V3.2"
+    assert model.object == "model"
+    assert model.owned_by == "DeepSeek"
+    assert model.created > 0
+
+
+def test_zyphra_item_to_model_handles_missing_release_date() -> None:
+    """Items missing or with malformed releaseDate should still convert with created=0."""
+    item = {"modelId": "zyphra/ZAYA1-8B", "organization": "Zyphra"}
+    model = ZyphraProvider._zyphra_item_to_model(item)
+    assert model.id == "zyphra/ZAYA1-8B"
+    assert model.created == 0
+    assert model.owned_by == "Zyphra"
+
+    bad_item = {"modelId": "x/y", "organization": "x", "releaseDate": "not-a-date"}
+    bad_model = ZyphraProvider._zyphra_item_to_model(bad_item)
+    assert bad_model.created == 0
+
+
+def test_zyphra_item_to_model_defaults_owned_by_when_missing() -> None:
+    """Items without an organization key fall back to 'zyphra'."""
+    item = {"modelId": "x/y", "releaseDate": "2026-01-01"}
+    model = ZyphraProvider._zyphra_item_to_model(item)
+    assert model.owned_by == "zyphra"
