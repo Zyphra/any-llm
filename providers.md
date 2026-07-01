@@ -54,4 +54,3 @@ description: Complete list of LLM providers supported by any-llm including OpenA
 | [`watsonx`](https://www.ibm.com/watsonx) | WATSONX_API_KEY | WATSONX_URL | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | [`xai`](https://x.ai/) | XAI_API_KEY | XAI_API_BASE | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | [`zai`](https://docs.z.ai/guides/develop/python/introduction) | ZAI_API_KEY | ZAI_BASE_URL | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
-| [`zyphra`](https://zyphra.com) | ZYPHRA_API_KEY | ZYPHRA_API_BASE | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
