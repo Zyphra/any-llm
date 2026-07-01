@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Redirecting...</title>
+    <meta name="robots" content="noindex">
+    <meta http-equiv="refresh" content="0; url=https://docs.mozilla.ai/any-llm/">
+    <script>
+      const docsBaseUrl = new URL("https://docs.mozilla.ai/any-llm/");
+      const pagesBasePath = "/any-llm";
+
+      function normalizeRelativePath(pathname) {
+        let relativePath = pathname;
+
+        if (relativePath === pagesBasePath) {
+          relativePath = "/";
+        } else if (relativePath.startsWith(`${pagesBasePath}/`)) {
+          relativePath = relativePath.slice(pagesBasePath.length);
+        }
+
+        if (relativePath.endsWith("/index.html")) {
+          relativePath = relativePath.slice(0, -"/index.html".length) || "/";
+        } else if (relativePath.endsWith(".html")) {
+          relativePath = `${relativePath.slice(0, -".html".length)}/`;
+        }
+
+        if (!relativePath.startsWith("/")) {
+          relativePath = `/${relativePath}`;
+        }
+
+        if (relativePath !== "/" && !relativePath.endsWith("/") && !/\.[^/]+$/.test(relativePath)) {
+          relativePath = `${relativePath}/`;
+        }
+
+        return relativePath;
+      }
+
+      const relativePath = normalizeRelativePath(window.location.pathname);
+      const target = new URL(relativePath.replace(/^\//, ""), docsBaseUrl);
+      target.search = window.location.search;
+      target.hash = window.location.hash;
+      window.location.replace(target.toString());
+    </script>
+  </head>
+  <body>
+    <p>This documentation moved to <a href="https://docs.mozilla.ai/any-llm/">https://docs.mozilla.ai/any-llm/</a>.</p>
+  </body>
+</html>
