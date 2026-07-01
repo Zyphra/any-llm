@@ -5,9 +5,11 @@ import pytest
 from openresponses_types import ResponseResource
 
 from any_llm.providers.openai.base import BaseOpenAIProvider
+from any_llm.providers.openai.utils import split_request_input_for_openai
 from any_llm.types.completion import CompletionParams
-from any_llm.types.request import RequestParams
 from any_llm.types.model import Model
+from any_llm.types.request import RequestParams
+from any_llm.utils.request_state import OPENAI, encode_provider_state
 
 
 @patch("any_llm.providers.openai.base.AsyncOpenAI")
@@ -226,6 +228,80 @@ async def test_arequest_delegates_to_aresponses() -> None:
             "model": "gpt-test",
             "previous_response_id": None,
             "instructions": None,
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                    "encrypted_content": "enc_123",
+                }
+            ],
+            "error": None,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": False,
+            "text": {"format": {"type": "text"}},
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+            "max_output_tokens": None,
+            "max_tool_calls": None,
+            "store": False,
+            "background": False,
+            "service_tier": "default",
+            "metadata": {},
+            "safety_identifier": None,
+            "prompt_cache_key": None,
+        }
+    )
+
+    with patch("any_llm.providers.openai.base.AsyncOpenAI"):
+        provider = TestProvider(api_key="test-key")
+        provider._aresponses = AsyncMock(return_value=response)  # type: ignore[method-assign]
+
+        result = await provider._arequest(
+            RequestParams(
+                model="gpt-test",
+                input=[{"type": "message", "role": "user", "content": "Hello"}],
+            )
+        )
+
+        assert result.id == response.id
+        assert result.structured_output is None
+        assert result.output[-1].type == "reasoning"
+        provider._aresponses.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_arequest_serializes_request_items_for_responses() -> None:
+    class TestProvider(BaseOpenAIProvider):
+        PROVIDER_NAME = "TestProvider"
+        ENV_API_KEY_NAME = "TEST_API_KEY"
+        PROVIDER_DOCUMENTATION_URL = "https://example.com"
+
+    response = ResponseResource.model_validate(
+        {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 0,
+            "completed_at": 0,
+            "status": "completed",
+            "incomplete_details": None,
+            "model": "gpt-test",
+            "previous_response_id": None,
+            "instructions": None,
             "output": [],
             "error": None,
             "tools": [],
@@ -261,7 +337,133 @@ async def test_arequest_delegates_to_aresponses() -> None:
         provider = TestProvider(api_key="test-key")
         provider._aresponses = AsyncMock(return_value=response)  # type: ignore[method-assign]
 
-        result = await provider._arequest(RequestParams(model="gpt-test", input="Hello"))
+        await provider._arequest(
+            RequestParams(
+                model="gpt-test",
+                input=[{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+            )
+        )
 
-        assert result == response
         provider._aresponses.assert_called_once()
+        called_params = provider._aresponses.call_args.args[0]
+        assert called_params.input == [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
+        ]
+        assert called_params.tools is None
+
+
+@pytest.mark.asyncio
+async def test_arequest_converts_function_tools_for_responses() -> None:
+    class TestProvider(BaseOpenAIProvider):
+        PROVIDER_NAME = "TestProvider"
+        ENV_API_KEY_NAME = "TEST_API_KEY"
+        PROVIDER_DOCUMENTATION_URL = "https://example.com"
+
+    response = ResponseResource.model_validate(
+        {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 0,
+            "completed_at": 0,
+            "status": "completed",
+            "incomplete_details": None,
+            "model": "gpt-test",
+            "previous_response_id": None,
+            "instructions": None,
+            "output": [],
+            "error": None,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": False,
+            "text": {"format": {"type": "text"}},
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+            "max_output_tokens": None,
+            "max_tool_calls": None,
+            "store": False,
+            "background": False,
+            "service_tier": "default",
+            "metadata": {},
+            "safety_identifier": None,
+            "prompt_cache_key": None,
+        }
+    )
+
+    with patch("any_llm.providers.openai.base.AsyncOpenAI"):
+        provider = TestProvider(api_key="test-key")
+        provider._aresponses = AsyncMock(return_value=response)  # type: ignore[method-assign]
+
+        await provider._arequest(
+            RequestParams(
+                model="gpt-test",
+                input=[{"type": "message", "role": "user", "content": "Hello"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Look something up",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+        )
+
+        # OpenAI's Responses API accepts the chat-completions function-tool shape
+        # natively, so we forward the tools list unchanged.
+        called_params = provider._aresponses.call_args.args[0]
+        assert called_params.tools == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+
+def test_split_request_input_uses_previous_response_id_and_trims_replayed_history() -> None:
+    request_input = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "First prompt"}]},
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": encode_provider_state(OPENAI, "resp_123"),
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Old assistant turn"}],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "15",
+        },
+    ]
+
+    responses_input, previous_response_id = split_request_input_for_openai(request_input)
+
+    assert previous_response_id == "resp_123"
+    assert responses_input == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "15",
+        }
+    ]

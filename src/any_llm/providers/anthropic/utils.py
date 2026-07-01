@@ -2,17 +2,6 @@ import json
 from typing import TYPE_CHECKING, Any, cast
 
 from anthropic import transform_schema
-from openresponses_types import ResponseResource
-from openresponses_types.types import (
-    AssistantMessageItemParam,
-    DeveloperMessageItemParam,
-    FunctionCallItemParam,
-    FunctionCallOutputItemParam,
-    ItemReferenceParam,
-    Reasoning as ResponseReasoningConfig,
-    SystemMessageItemParam,
-    UserMessageItemParam,
-)
 from anthropic.types import (
     ContentBlockDeltaEvent,
     ContentBlockStartEvent,
@@ -21,6 +10,21 @@ from anthropic.types import (
     MessageStopEvent,
 )
 from anthropic.types.model_info import ModelInfo as AnthropicModelInfo
+from openresponses_types import ResponseResource, Usage
+from openresponses_types.types import (
+    AssistantMessageItemParam,
+    DeveloperMessageItemParam,
+    FunctionCallItemParam,
+    InputTokensDetails,
+    JsonObjectResponseFormat,
+    JsonSchemaResponseFormatParam,
+    OutputTokensDetails,
+    ReasoningBody,
+    SpecificToolChoiceParam,
+    SystemMessageItemParam,
+    ToolChoiceValueEnum,
+    UserMessageItemParam,
+)
 
 from any_llm.exceptions import UnsupportedParameterError
 from any_llm.logging import logger
@@ -38,15 +42,16 @@ from any_llm.types.completion import (
     Reasoning,
 )
 from any_llm.types.model import Model
-from any_llm.types.request import RequestInput, RequestParams, RequestReasoningItemParam, normalize_request_input
+from any_llm.types.request import RequestInput, RequestParams, RequestResponseFormatParam
+from any_llm.utils.openresponses_compat import request_content_to_text
 from any_llm.utils.request_output import (
+    OutputItem,
     make_function_call_item,
+    make_reasoning_item,
     make_response_resource,
     make_text_message,
-    make_usage,
-    make_reasoning_item,
 )
-from any_llm.utils.request_state import decode_request_state, encode_request_state
+from any_llm.utils.request_state import CLAUDE, decode_provider_state, encode_provider_state
 from any_llm.utils.structured_output import get_json_schema, is_structured_output_type
 
 if TYPE_CHECKING:
@@ -360,8 +365,8 @@ def _convert_tool_spec(openai_tools: list[dict[str, Any]]) -> list[dict[str, Any
             "description": tool["description"],
             "input_schema": {
                 "type": "object",
-                "properties": tool["parameters"].get("properties") or {},
-                "required": tool["parameters"].get("required", []),
+                "properties": params.get("properties") or {},
+                "required": params.get("required", []),
             },
         }
         anthropic_tools.append(anthropic_tool)
@@ -402,6 +407,29 @@ def _convert_response_format(response_format: dict[str, Any] | type, provider_na
         else:
             msg = f"Unsupported response_format type: {response_format.get('type')}"
             raise ValueError(msg)
+    else:
+        msg = f"Unsupported response_format: {response_format}"
+        raise ValueError(msg)
+
+    return {"format": {"type": "json_schema", "schema": transform_schema(schema)}}
+
+
+def _convert_request_response_format(
+    response_format: RequestResponseFormatParam,
+    provider_name: str,
+) -> dict[str, object]:
+    """Convert request API response_format to Anthropic's output_config."""
+    if is_structured_output_type(response_format):
+        schema = get_json_schema(response_format)
+    elif isinstance(response_format, JsonSchemaResponseFormatParam):
+        schema = response_format.schema_ or {}
+    elif isinstance(response_format, JsonObjectResponseFormat):
+        msg = "response_format with type 'json_object'"
+        raise UnsupportedParameterError(
+            msg,
+            provider_name,
+            "Use a Pydantic model or json_schema format instead.",
+        )
     else:
         msg = f"Unsupported response_format: {response_format}"
         raise ValueError(msg)
@@ -461,106 +489,54 @@ def _convert_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
     return result_kwargs
 
 
-def _request_message_text(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                part_type = part.get("type")
-                if part_type in ("input_text", "output_text", "text", "reasoning_text", "summary_text"):
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif part_type == "refusal":
-                    refusal = part.get("refusal")
-                    if isinstance(refusal, str):
-                        parts.append(refusal)
-        return "".join(parts)
-    return ""
+def _convert_models_list(models_list: list[AnthropicModelInfo]) -> list[Model]:
+    """Convert Anthropic models list to OpenAI format."""
+    return [
+        Model(id=model.id, object="model", created=int(model.created_at.timestamp()), owned_by="anthropic")
+        for model in models_list
+    ]
 
 
-def _convert_request_tools(openai_tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-    if not openai_tools:
-        return None
-    return _convert_tool_spec(openai_tools)
+# --- arequest support -------------------------------------------------------
+# Translation between OpenResponses input/output and the native Messages API.
+# State preservation: Anthropic emits a `signature` on each ThinkingBlock we need to preserve
 
 
-def _convert_request_tool_choice(tool_choice: str | dict[str, Any] | None) -> dict[str, Any] | None:
-    if tool_choice is None:
-        return None
-    if isinstance(tool_choice, str):
-        if tool_choice == "required":
-            tool_choice = "any"
-        return {"type": tool_choice, "disable_parallel_tool_use": False}
-    if tool_choice_type := tool_choice.get("type"):
-        if tool_choice_type in ("custom", "function"):
-            return {"type": "tool", "name": tool_choice[tool_choice_type]["name"]}
-        if tool_choice_type in ("tool", "auto", "any", "none"):
-            return cast("dict[str, Any]", tool_choice)
-    msg = f"Unsupported tool_choice format: {tool_choice}"
-    raise ValueError(msg)
-
-
-def _convert_request_input(
-    input_data: RequestInput, instructions: str | None
-) -> tuple[str | None, list[dict[str, Any]]]:
-    if isinstance(input_data, str):
-        return instructions, [{"role": "user", "content": input_data}]
-
+def _convert_request_input(input_data: RequestInput, instructions: str | None):
+    """Convert OpenResponses input items into an Anthropic (system, messages) pair."""
     system_parts: list[str] = [instructions] if instructions else []
-    messages: list[dict[str, Any]] = []
-    pending_assistant_blocks: list[dict[str, Any]] = []
+    messages: list[dict[str, object]] = []
+    pending_assistant: list[dict[str, object]] = []
 
-    def flush_assistant_blocks() -> None:
-        nonlocal pending_assistant_blocks
-        if pending_assistant_blocks:
-            messages.append({"role": "assistant", "content": pending_assistant_blocks})
-            pending_assistant_blocks = []
+    def _flush_assistant() -> None:
+        if pending_assistant:
+            messages.append({"role": "assistant", "content": list(pending_assistant)})
+            pending_assistant.clear()
 
-    for item in normalize_request_input(input_data):
-        if isinstance(item, ItemReferenceParam):
-            msg = "item_reference is not supported for anthropic arequest"
-            raise UnsupportedParameterError(msg, "anthropic")
+    for item in input_data:
         if isinstance(item, (SystemMessageItemParam, DeveloperMessageItemParam)):
-            system_text = _request_message_text(item.content)
-            if system_text:
-                system_parts.append(system_text)
-            continue
-        if isinstance(item, UserMessageItemParam):
-            flush_assistant_blocks()
-            messages.append({"role": "user", "content": _request_message_text(item.content)})
-            continue
-        if isinstance(item, AssistantMessageItemParam):
-            assistant_text = _request_message_text(item.content)
-            if assistant_text:
-                pending_assistant_blocks.append({"type": "text", "text": assistant_text})
-            continue
-        if isinstance(item, RequestReasoningItemParam):
-            state = decode_request_state(item.encrypted_content, "anthropic")
-            thinking_text = _request_message_text(item.content)
-            signature = state.get("signature") if isinstance(state, dict) else None
-            if signature is not None and isinstance(signature, str):
-                pending_assistant_blocks.append(
-                    {"type": "thinking", "thinking": thinking_text, "signature": signature}
-                )
-            elif thinking_text:
-                pending_assistant_blocks.append({"type": "text", "text": thinking_text})
-            continue
-        if isinstance(item, FunctionCallItemParam):
-            pending_assistant_blocks.append(
-                {
-                    "type": "tool_use",
-                    "id": item.call_id,
-                    "name": item.name,
-                    "input": json.loads(item.arguments),
-                }
+            if text := request_content_to_text(item.content):
+                system_parts.append(text)
+        elif isinstance(item, UserMessageItemParam):
+            _flush_assistant()
+            messages.append({"role": "user", "content": request_content_to_text(item.content)})
+        elif isinstance(item, AssistantMessageItemParam):
+            if text := request_content_to_text(item.content):
+                pending_assistant.append({"type": "text", "text": text})
+        elif isinstance(item, ReasoningBody):
+            signature = decode_provider_state(item.encrypted_content, CLAUDE)
+            text = request_content_to_text(item.content)
+            if signature:
+                pending_assistant.append({"type": "thinking", "thinking": text, "signature": signature})
+            elif text:
+                # Fallback: forward as plain text so the model still sees the prior chain-of-thought.
+                pending_assistant.append({"type": "text", "text": text})
+        elif isinstance(item, FunctionCallItemParam):
+            pending_assistant.append(
+                {"type": "tool_use", "id": item.call_id, "name": item.name, "input": json.loads(item.arguments)}
             )
-            continue
-        if isinstance(item, FunctionCallOutputItemParam):
-            flush_assistant_blocks()
-            tool_output = item.output if isinstance(item.output, str) else _request_message_text(item.output)
+        else:
+            _flush_assistant()
             messages.append(
                 {
                     "role": "user",
@@ -568,80 +544,108 @@ def _convert_request_input(
                         {
                             "type": "tool_result",
                             "tool_use_id": item.call_id,
-                            "content": tool_output,
+                            "content": request_content_to_text(item.output),
                         }
                     ],
                 }
             )
-            continue
 
-    flush_assistant_blocks()
-    system_message = "\n".join(part for part in system_parts if part) or None
-    return system_message, messages
+    _flush_assistant()
+    system = "\n".join(p for p in system_parts if p) or None
+    return system, messages
 
 
-def _convert_request_response(
-    response: Message,
-    *,
-    params: RequestParams,
-) -> ResponseResource:
-    output_items: list[object] = []
-    reasoning_tokens = 0
-    if hasattr(response.usage, "output_tokens") and isinstance(response.usage.output_tokens, int):
-        reasoning_tokens = 0
+def _convert_request_params(params: RequestParams, provider_name: str, **kwargs: object) -> dict[str, object]:
+    """Build kwargs for ``anthropic.AsyncAnthropic.messages.create`` from RequestParams."""
+    api_kwargs = params.model_dump(include={"model", "temperature", "top_p", "metadata"}, exclude_none=True)
 
-    for content_block in response.content:
-        if content_block.type == "thinking":
-            encrypted_content = encode_request_state("anthropic", {"signature": content_block.signature})
-            output_items.append(make_reasoning_item(content_block.thinking, encrypted_content=encrypted_content))
-        elif content_block.type == "tool_use":
-            output_items.append(
-                make_function_call_item(
-                    call_id=content_block.id,
-                    name=content_block.name,
-                    arguments=json.dumps(content_block.input),
-                )
-            )
-        elif content_block.type == "text":
-            output_items.append(make_text_message(content_block.text))
+    system, messages = _convert_request_input(params.input, params.instructions)
+    api_kwargs["messages"] = messages
+    if system is not None:
+        api_kwargs["system"] = system
+
+    api_kwargs["max_tokens"] = params.max_output_tokens or DEFAULT_MAX_TOKENS
+    if params.stop is not None:
+        api_kwargs["stop_sequences"] = [params.stop] if isinstance(params.stop, str) else list(params.stop)
+
+    if params.tools:
+        api_kwargs["tools"] = _convert_tool_spec(params.tools)
+    tool_choice: dict[str, object] | None = None
+    if params.tool_choice is not None:
+        root_choice = params.tool_choice.root
+        if isinstance(root_choice, ToolChoiceValueEnum):
+            tool_choice = {
+                "type": "any" if root_choice == ToolChoiceValueEnum.required else root_choice.value,
+                "disable_parallel_tool_use": False,
+            }
+        elif isinstance(root_choice, SpecificToolChoiceParam):
+            tool_choice = {"type": "tool", "name": root_choice.root.name}
         else:
-            msg = f"Unsupported content block type: {content_block.type}"
+            msg = f"Unsupported tool_choice format for Anthropic arequest: {params.tool_choice.model_dump(mode='json')}"
+            raise ValueError(msg)
+
+    output_config: dict[str, object] | None = None
+    if params.response_format is not None:
+        output_config = _convert_request_response_format(params.response_format, provider_name)
+
+    if params.reasoning is not None:
+        # Anthropic extended thinking is incompatible with forced tool choice; downgrade to auto.
+        if tool_choice is not None and tool_choice["type"] in {"any", "tool"}:
+            logger.warning("Anthropic extended thinking does not support forced tool choice; downgrading to auto")
+            tool_choice = {"type": "auto", "disable_parallel_tool_use": False}
+
+        effort = params.reasoning.effort
+        if effort is None or effort == "none":
+            api_kwargs["thinking"] = {"type": "disabled"}
+        else:
+            api_kwargs["thinking"] = {"type": "adaptive"}
+            if output_config is None:
+                output_config = {}
+            output_config["effort"] = REASONING_EFFORT_TO_ANTHROPIC_EFFORT[effort]
+
+    if tool_choice is not None:
+        api_kwargs["tool_choice"] = tool_choice
+    if output_config is not None:
+        api_kwargs["output_config"] = output_config
+
+    api_kwargs.update(kwargs)
+    return api_kwargs
+
+
+def _convert_request_response(response: Message, *, params: RequestParams) -> ResponseResource:
+    """Convert an Anthropic ``Message`` into an OpenResponses ``ResponseResource``."""
+    output: list[OutputItem] = []
+    for block in response.content:
+        if block.type == "thinking":
+            output.append(
+                make_reasoning_item(block.thinking, encrypted_content=encode_provider_state(CLAUDE, block.signature))
+            )
+        elif block.type == "tool_use":
+            output.append(make_function_call_item(call_id=block.id, name=block.name, arguments=json.dumps(block.input)))
+        elif block.type == "text":
+            output.append(make_text_message(block.text))
+        else:
+            msg = f"Unsupported content block type: {block.type}"
             raise ValueError(msg)
 
     cache_read = response.usage.cache_read_input_tokens or 0
     cache_creation = response.usage.cache_creation_input_tokens or 0
-    input_tokens = response.usage.input_tokens + cache_read + cache_creation
-    usage = make_usage(
-        input_tokens=input_tokens,
-        output_tokens=response.usage.output_tokens,
-        cached_tokens=cache_read,
-        reasoning_tokens=reasoning_tokens,
-    )
-    reasoning_cfg = None
-    if params.reasoning is not None:
-        reasoning_cfg = ResponseReasoningConfig(
-            effort=cast("Any", params.reasoning.get("effort")),
-            summary=cast("Any", params.reasoning.get("summary")),
-        )
-
     return make_response_resource(
         model=response.model,
-        output=cast("list[Any]", output_items),
+        output=output,
         tools=params.tools,
         tool_choice=params.tool_choice,
         temperature=params.temperature,
         top_p=params.top_p,
         max_output_tokens=params.max_output_tokens,
-        reasoning=reasoning_cfg,
-        usage=usage,
+        reasoning=params.reasoning,
+        usage=Usage(
+            input_tokens=response.usage.input_tokens + cache_read + cache_creation,
+            output_tokens=response.usage.output_tokens,
+            total_tokens=response.usage.input_tokens + cache_read + cache_creation + response.usage.output_tokens,
+            input_tokens_details=InputTokensDetails(cached_tokens=cache_read),
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        ),
         instructions=params.instructions,
         metadata=params.metadata,
     )
-
-
-def _convert_models_list(models_list: list[AnthropicModelInfo]) -> list[Model]:
-    """Convert Anthropic models list to OpenAI format."""
-    return [
-        Model(id=model.id, object="model", created=int(model.created_at.timestamp()), owned_by="anthropic")
-        for model in models_list
-    ]

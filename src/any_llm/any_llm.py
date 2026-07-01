@@ -36,7 +36,15 @@ from any_llm.types.messages import (
     MessageStreamEvent,
 )
 from any_llm.types.provider import PlatformKey, ProviderMetadata
-from any_llm.types.request import RequestInput, RequestParams, RequestResponse, RequestStreamEvent
+from any_llm.types.request import (
+    RequestInput,
+    RequestParams,
+    RequestReasoningParam,
+    RequestResponse,
+    RequestResponseFormatParam,
+    RequestTool,
+    RequestToolChoiceParam,
+)
 from any_llm.types.responses import Response, ResponseInputParam, ResponsesParams, ResponseStreamEvent
 from any_llm.utils.aio import async_coro_to_sync_iter, async_iter_to_sync_iter, run_async_in_sync
 from any_llm.utils.exception_handler import handle_exceptions
@@ -46,6 +54,8 @@ ResponseFormatT = TypeVar("ResponseFormatT", bound=BaseModel)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Sequence
+
+    from openresponses_types.types import Reasoning
 
     from any_llm.types.batch import Batch, BatchResult
     from any_llm.types.completion import ChatCompletionChunk, CreateEmbeddingResponse
@@ -802,62 +812,68 @@ class AnyLLM(ABC):
             return response
         return async_iter_to_sync_iter(response, allow_running_loop=allow_running_loop)
 
-    def request(self, **kwargs: Any) -> RequestResponse | Iterator[RequestStreamEvent]:
+    def request(self, **kwargs: Any) -> RequestResponse:
         """Create a response using the experimental request API synchronously."""
         allow_running_loop = kwargs.pop("allow_running_loop", INSIDE_NOTEBOOK)
-        if kwargs.get("stream"):
-            return async_coro_to_sync_iter(
-                cast("Coroutine[Any, Any, AsyncIterator[RequestStreamEvent]]", self.arequest(**kwargs)),
-                allow_running_loop=allow_running_loop,
-            )
+        return run_async_in_sync(self.arequest(**kwargs), allow_running_loop=allow_running_loop)
 
-        response = run_async_in_sync(self.arequest(**kwargs), allow_running_loop=allow_running_loop)
-        if isinstance(response, ResponseResource):
-            return response
-        return async_iter_to_sync_iter(response, allow_running_loop=allow_running_loop)
-
-    @handle_exceptions(wrap_streaming=True)
+    @handle_exceptions(wrap_streaming=False)
     async def arequest(
         self,
         model: str,
         input_data: RequestInput,
         *,
-        tools: list[dict[str, Any] | Callable[..., Any]] | Any | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
+        tools: list[dict[str, Any] | Callable[..., Any]] | None = None,
+        tool_choice: RequestToolChoiceParam | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         stream: bool | None = None,
+        response_format: RequestResponseFormatParam | None = None,
+        stop: str | list[str] | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        seed: int | None = None,
+        parallel_tool_calls: bool | None = None,
         instructions: str | None = None,
-        reasoning: dict[str, Any] | None = None,
+        reasoning: RequestReasoningParam | None = None,
         metadata: dict[str, str] | None = None,
         **kwargs: Any,
-    ) -> RequestResponse | AsyncIterator[RequestStreamEvent]:
-        """Create a response using the experimental stateful request API."""
-        prepared_tools = None
-        if tools:
-            prepared_tools = prepare_tools(tools, built_in_tools=self.BUILT_IN_TOOLS)
+    ) -> RequestResponse:
+        """Create a response using the experimental stateful request API.
+
+        Streaming is not yet implemented; ``stream=True`` will raise. See
+        ``docs/internal/arequest_streaming.md`` for the planned design.
+        """
+        if stream:
+            msg = "Streaming is not yet supported for arequest; see docs/internal/arequest_streaming.md."
+            raise NotImplementedError(msg)
+        prepared_tools = prepare_tools(tools, built_in_tools=self.BUILT_IN_TOOLS) if tools else None
 
         params = RequestParams(
             model=model,
             input=input_data,
-            tools=cast("list[dict[str, Any]] | None", prepared_tools),
+            tools=cast("list[RequestTool] | None", prepared_tools),
             tool_choice=tool_choice,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
             top_p=top_p,
             stream=stream,
+            response_format=response_format,
+            stop=stop,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            seed=seed,
+            parallel_tool_calls=parallel_tool_calls,
             instructions=instructions,
-            reasoning=reasoning,
+            reasoning=cast("Reasoning | None", reasoning),
             metadata=metadata,
         )
         return await self._arequest(params, **kwargs)
 
-    async def _arequest(
-        self, params: RequestParams, **kwargs: Any
-    ) -> RequestResponse | AsyncIterator[RequestStreamEvent]:
+    async def _arequest(self, params: RequestParams, **kwargs: Any) -> RequestResponse:
         if not self.SUPPORTS_REQUESTS:
-            msg = "Provider doesn't support requests."
+            msg = f"Provider {self.PROVIDER_NAME} does not support arequest."
             raise NotImplementedError(msg)
         msg = "Subclasses must implement _arequest method"
         raise NotImplementedError(msg)

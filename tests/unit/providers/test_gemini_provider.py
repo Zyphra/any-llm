@@ -5,21 +5,35 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from google.genai import types
+from openresponses_types.types import SpecificFunctionParam, SpecificToolChoiceParam, ToolChoiceParam
 
 from any_llm.exceptions import InvalidRequestError, UnsupportedParameterError
 from any_llm.providers.gemini import GeminiProvider
 from any_llm.providers.gemini.base import REASONING_EFFORT_TO_THINKING_BUDGETS, GoogleProvider
 from any_llm.providers.gemini.utils import (
-    _convert_request_input,
-    _convert_request_response,
+    _completion_to_request_response,
     _convert_messages,
     _convert_response_to_response_dict,
     _convert_tool_spec,
     _create_openai_chunk_from_google_chunk,
+    request_input_to_completion_messages,
 )
-from any_llm.types.completion import CompletionParams, PromptTokensDetails, ReasoningEffort
+from any_llm.types.completion import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessage,
+    ChatCompletionMessageFunctionToolCall,
+    Choice,
+    ChoiceDelta,
+    ChunkChoice,
+    CompletionParams,
+    Function,
+    PromptTokensDetails,
+    Reasoning,
+    ReasoningEffort,
+)
 from any_llm.types.request import RequestParams
-from any_llm.utils.request_state import encode_request_state
+from any_llm.utils.request_state import CLAUDE, GEMINI, encode_provider_state
 
 TEST_IMAGE_BYTES = b"test-image-bytes"
 TEST_PDF_BYTES = b"%PDF-1.4\ntest"
@@ -267,6 +281,30 @@ async def test_completion_without_tool_choice() -> None:
         generation_config = call_kwargs["config"]
 
         assert generation_config.tool_config is None
+
+
+@pytest.mark.asyncio
+async def test_completion_with_specific_tool_choice() -> None:
+    api_key = "test-api-key"
+    model = "gemini-pro"
+    messages = [{"role": "user", "content": "Hello"}]
+
+    with mock_gemini_provider() as mock_genai:
+        provider = GeminiProvider(api_key=api_key)
+        await provider._acompletion(
+            CompletionParams(
+                model_id=model,
+                messages=messages,
+                tool_choice={"type": "function", "function": {"name": "lookup_weather"}},
+            )
+        )
+
+        _, call_kwargs = mock_genai.return_value.aio.models.generate_content.call_args
+        generation_config = call_kwargs["config"]
+        function_calling_config = generation_config.tool_config.function_calling_config
+
+        assert function_calling_config.mode.value == "ANY"
+        assert function_calling_config.allowed_function_names == ["lookup_weather"]
 
 
 @pytest.mark.asyncio
@@ -1534,17 +1572,14 @@ def test_timeout_in_client_args_does_not_override_explicit_http_options() -> Non
         assert call_kwargs["http_options"].timeout == 10_000
 
 
-def test_convert_request_input_restores_thought_signature() -> None:
-    contents, system_instruction = _convert_request_input(
+def test_request_input_to_completion_messages_forwards_signature_via_extra_content() -> None:
+    messages = request_input_to_completion_messages(
         [
             {
                 "type": "reasoning",
                 "summary": [],
                 "content": [{"type": "reasoning_text", "text": "Thinking"}],
-                "encrypted_content": encode_request_state(
-                    "gemini",
-                    {"thought_signatures": [base64.b64encode(b"sig").decode("ascii")]},
-                ),
+                "encrypted_content": encode_provider_state(GEMINI, "sig-base64"),
             },
             {
                 "type": "function_call",
@@ -1555,20 +1590,18 @@ def test_convert_request_input_restores_thought_signature() -> None:
         ]
     )
 
-    assert system_instruction is None
-    function_call_part = contents[0].parts[0]
-    assert function_call_part.function_call is not None
-    assert function_call_part.thought_signature == b"sig"
+    tool_call = messages[0]["tool_calls"][0]
+    assert tool_call["extra_content"]["google"]["thought_signature"] == "sig-base64"
 
 
-def test_convert_request_input_ignores_foreign_state() -> None:
-    contents, _ = _convert_request_input(
+def test_request_input_to_completion_messages_ignores_foreign_state() -> None:
+    messages = request_input_to_completion_messages(
         [
             {
                 "type": "reasoning",
                 "summary": [],
                 "content": [{"type": "reasoning_text", "text": "Foreign"}],
-                "encrypted_content": encode_request_state("anthropic", {"signature": "sig"}),
+                "encrypted_content": encode_provider_state(CLAUDE, "sig"),
             },
             {
                 "type": "function_call",
@@ -1579,69 +1612,179 @@ def test_convert_request_input_ignores_foreign_state() -> None:
         ]
     )
 
-    assert contents[0].parts[0].thought_signature is not None
-    assert contents[0].parts[0].thought_signature != b"sig"
+    # Foreign signature was dropped, so the only extra_content is the
+    # skip-validator sentinel for the leading function call.
+    tool_call = messages[0]["tool_calls"][0]
+    assert tool_call["extra_content"]["google"]["thought_signature"] == "skip_thought_signature_validator"
 
 
-def test_convert_request_response_preserves_signature() -> None:
-    part_reasoning = types.Part(text="Thinking")
-    part_reasoning.thought = True
-    part_call = types.Part(function_call=types.FunctionCall(name="lookup_weather", args={"city": "Paris"}))
-    part_call.thought_signature = b"sig"
-    response = Mock()
-    response.candidates = [Mock(content=types.Content(role="model", parts=[part_reasoning, part_call]))]
-    response.usage_metadata = Mock(
-        cached_content_token_count=0,
-        prompt_token_count=10,
-        candidates_token_count=5,
-        thoughts_token_count=2,
+def test_completion_to_request_response_preserves_signature() -> None:
+    completion = ChatCompletion(
+        id="chatcmpl_test",
+        object="chat.completion",
+        created=0,
+        model="gemini-2.5-flash",
+        choices=[
+            Choice(
+                index=0,
+                finish_reason="tool_calls",
+                message=ChatCompletionMessage(
+                    role="assistant",
+                    content=None,
+                    reasoning=Reasoning(content="Thinking"),
+                    tool_calls=[
+                        ChatCompletionMessageFunctionToolCall(
+                            id="call_123",
+                            type="function",
+                            function=Function(name="lookup_weather", arguments='{"city":"Paris"}'),
+                            extra_content={"google": {"thought_signature": "sig-base64"}},
+                        )
+                    ],
+                ),
+            )
+        ],
+        usage=None,
     )
-    response.model_version = "gemini-2.5-flash"
-
-    resource = _convert_request_response(response, params=RequestParams(model="gemini-2.5-flash", input="Hello"))
+    resource = _completion_to_request_response(
+        completion,
+        params=RequestParams(
+            model="gemini-2.5-flash",
+            input=[{"type": "message", "role": "user", "content": "Hello"}],
+        ),
+    )
 
     assert resource.output[0].type == "reasoning"
-    assert resource.output[0].encrypted_content is not None
+    assert resource.output[0].encrypted_content == encode_provider_state(GEMINI, "sig-base64")
     assert resource.output[1].type == "function_call"
+
+
+def test_request_input_to_completion_messages_preserves_media_and_tool_output_name() -> None:
+    messages = request_input_to_completion_messages(
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect these"},
+                    {"type": "input_image", "image_url": "https://example.com/a.png"},
+                    {"type": "input_file", "file_data": "data:application/pdf;base64,Zm9v"},
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "lookup_weather",
+                "arguments": '{"city":"Paris"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "Sunny",
+            },
+        ]
+    )
+
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"][0] == {"type": "text", "text": "Inspect these"}
+    assert messages[0]["content"][1] == {"type": "image_url", "image_url": "https://example.com/a.png"}
+    assert messages[0]["content"][2] == {"type": "file", "file": {"file_data": "data:application/pdf;base64,Zm9v"}}
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "lookup_weather"
+    assert messages[2] == {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": "Sunny",
+        "name": "lookup_weather",
+    }
 
 
 @pytest.mark.asyncio
 async def test_arequest_non_streaming() -> None:
-    part_reasoning = types.Part(text="Thinking")
-    part_reasoning.thought = True
-    response = Mock()
-    response.candidates = [Mock(content=types.Content(role="model", parts=[part_reasoning]))]
-    response.usage_metadata = Mock(
-        cached_content_token_count=0,
-        prompt_token_count=10,
-        candidates_token_count=5,
-        thoughts_token_count=2,
-    )
-    response.model_version = "gemini-2.5-flash"
-
     with mock_gemini_provider() as mock_genai:
-        mock_genai.return_value.aio.models.generate_content = AsyncMock(return_value=response)
         provider = GeminiProvider(api_key="test-key")
-        result = await provider._arequest(RequestParams(model="gemini-2.5-flash", input="Hello"))
+        provider._acompletion = AsyncMock(
+            return_value=ChatCompletion(
+                id="chatcmpl_test",
+                object="chat.completion",
+                created=0,
+                model="gemini-2.5-flash",
+                choices=[
+                    Choice(
+                        index=0,
+                        finish_reason="stop",
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content=None,
+                            reasoning=Reasoning(content="Thinking"),
+                        ),
+                    )
+                ],
+                usage=None,
+            )
+        )
+        result = await provider._arequest(
+            RequestParams(
+                model="gemini-2.5-flash",
+                input=[{"type": "message", "role": "user", "content": "Hello"}],
+            )
+        )
         assert result.output[0].type == "reasoning"
 
 
 @pytest.mark.asyncio
-async def test_arequest_streaming_returns_events() -> None:
-    response = Mock()
-    response.candidates = [Mock(content=types.Content(role="model", parts=[types.Part.from_text(text="Hi!")]))]
-    response.usage_metadata = Mock(
-        cached_content_token_count=0,
-        prompt_token_count=10,
-        candidates_token_count=5,
-        thoughts_token_count=0,
-    )
-    response.model_version = "gemini-2.5-flash"
-
-    with mock_gemini_provider() as mock_genai:
-        mock_genai.return_value.aio.models.generate_content = AsyncMock(return_value=response)
+async def test_arequest_rejects_streaming() -> None:
+    with mock_gemini_provider():
         provider = GeminiProvider(api_key="test-key")
-        stream = await provider._arequest(RequestParams(model="gemini-2.5-flash", input="Hello", stream=True))
-        events = [event async for event in stream]
-        assert events[0].type == "response.created"
-        assert events[-1].type == "response.completed"
+        with pytest.raises(NotImplementedError, match="Streaming is not yet implemented for arequest"):
+            await provider._arequest(
+                RequestParams(
+                    model="gemini-2.5-flash",
+                    input=[{"type": "message", "role": "user", "content": "Hello"}],
+                    stream=True,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_arequest_with_specific_tool_choice() -> None:
+    with mock_gemini_provider():
+        provider = GeminiProvider(api_key="test-key")
+        provider._acompletion = AsyncMock(
+            return_value=ChatCompletion(
+                id="chatcmpl_test",
+                object="chat.completion",
+                created=0,
+                model="gemini-2.5-flash",
+                choices=[
+                    Choice(
+                        index=0,
+                        finish_reason="tool_calls",
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content=None,
+                            tool_calls=[
+                                ChatCompletionMessageFunctionToolCall(
+                                    id="call_123",
+                                    type="function",
+                                    function=Function(name="lookup_weather", arguments="{}"),
+                                )
+                            ],
+                        ),
+                    )
+                ],
+                usage=None,
+            )
+        )
+
+        await provider._arequest(
+            RequestParams(
+                model="gemini-2.5-flash",
+                input=[{"type": "message", "role": "user", "content": "Hello"}],
+                tool_choice=ToolChoiceParam(
+                    root=SpecificToolChoiceParam(root=SpecificFunctionParam(type="function", name="lookup_weather"))
+                ),
+            )
+        )
+
+        completion_params = provider._acompletion.call_args.args[0]
+        assert completion_params.tool_choice == {"type": "function", "function": {"name": "lookup_weather"}}

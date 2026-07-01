@@ -7,22 +7,30 @@ from typing import Any, Literal, cast
 
 from google.genai import types
 from google.genai.pagers import Pager
-from openresponses_types import ResponseResource
+from openresponses_types import Usage
 from openresponses_types.types import (
     AssistantMessageItemParam,
     DeveloperMessageItemParam,
     FunctionCallItemParam,
-    FunctionCallOutputItemParam,
-    ItemReferenceParam,
-    Reasoning as ResponseReasoningConfig,
+    InputFileContentParam,
+    InputImageContentParamAutoParam,
+    InputTextContentParam,
+    InputTokensDetails,
+    OutputTokensDetails,
+    ReasoningBody,
+    SpecificToolChoiceParam,
     SystemMessageItemParam,
+    ToolChoiceParam,
+    ToolChoiceValueEnum,
     UserMessageItemParam,
 )
 
 from any_llm.exceptions import InvalidRequestError
 from any_llm.logging import logger
 from any_llm.types.completion import (
+    ChatCompletion,
     ChatCompletionChunk,
+    ChatCompletionMessageFunctionToolCall,
     ChoiceDelta,
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
@@ -32,18 +40,19 @@ from any_llm.types.completion import (
     Embedding,
     PromptTokensDetails,
     Reasoning,
-    Usage,
 )
 from any_llm.types.model import Model
-from any_llm.types.request import RequestInput, RequestParams, RequestReasoningItemParam, normalize_request_input
+from any_llm.types.request import RequestInput, RequestParams, RequestResponse
+from any_llm.utils.openresponses_compat import RequestContentLike, request_content_parts, request_content_to_text
 from any_llm.utils.request_output import (
+    OutputItem,
+    finalize_request_response,
     make_function_call_item,
+    make_reasoning_item,
     make_response_resource,
     make_text_message,
-    make_usage,
-    make_reasoning_item,
 )
-from any_llm.utils.request_state import decode_request_state, encode_request_state
+from any_llm.utils.request_state import GEMINI, decode_provider_state, encode_provider_state
 
 _INLINE_SIZE_LIMIT = 20 * 1024 * 1024
 
@@ -94,13 +103,42 @@ def _convert_tool_spec(tools: list[dict[str, Any] | Any]) -> list[types.Tool]:
     return converted_tools
 
 
-def _convert_tool_choice(tool_choice: str) -> types.ToolConfig:
-    tool_choice_to_mode = {
-        "required": types.FunctionCallingConfigMode.ANY,
-        "auto": types.FunctionCallingConfigMode.AUTO,
-    }
+def _convert_tool_choice(tool_choice: str | dict[str, object]) -> types.ToolConfig:
+    if isinstance(tool_choice, str):
+        tool_choice_to_mode = {
+            "required": types.FunctionCallingConfigMode.ANY,
+            "auto": types.FunctionCallingConfigMode.AUTO,
+        }
+        return types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode=tool_choice_to_mode[tool_choice])
+        )
 
-    return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=tool_choice_to_mode[tool_choice]))
+    if tool_choice.get("type") == "function":
+        function_choice = tool_choice.get("function")
+        if isinstance(function_choice, dict) and isinstance(function_choice.get("name"), str):
+            return types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=types.FunctionCallingConfigMode.ANY,
+                    allowed_function_names=[function_choice["name"]],
+                )
+            )
+
+    msg = f"Unsupported Gemini tool_choice format: {tool_choice}"
+    raise ValueError(msg)
+
+
+def request_tool_choice_to_completion_tool_choice(tool_choice: ToolChoiceParam | None) -> str | dict[str, object] | None:
+    if tool_choice is None:
+        return None
+
+    root_choice = tool_choice.root
+    if isinstance(root_choice, ToolChoiceValueEnum):
+        return root_choice.value
+    if isinstance(root_choice, SpecificToolChoiceParam):
+        return {"type": "function", "function": {"name": root_choice.root.name}}
+
+    msg = f"Unsupported Gemini arequest tool_choice format: {tool_choice.model_dump(mode='json')}"
+    raise ValueError(msg)
 
 
 def _parse_data_uri(data_uri: str, field_name: str, provider_name: str) -> tuple[str, bytes]:
@@ -455,202 +493,192 @@ def _convert_models_list(models_list: Pager[types.Model]) -> list[Model]:
     return [Model(id=model.name or "Unknown", object="model", created=0, owned_by="google") for model in models_list]
 
 
-def _request_message_text(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                part_type = part.get("type")
-                if part_type in ("input_text", "output_text", "text", "reasoning_text", "summary_text"):
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif part_type == "refusal":
-                    refusal = part.get("refusal")
-                    if isinstance(refusal, str):
-                        parts.append(refusal)
-        return "".join(parts)
-    return ""
+# --- arequest support -------------------------------------------------------
+# Gemini's ``thought_signature`` lives on individual function-call parts, not on
+# a separate reasoning block. We bridge it through ``acompletion`` (which already
+# carries the signature in ``extra_content.google.thought_signature`` per the
+# OpenAI-compat surface) and stamp/decode it on the openresponses
+# ``encrypted_content`` field for round-tripping.
 
 
-def _decode_gemini_signatures(item: RequestReasoningItemParam) -> list[bytes]:
-    state = decode_request_state(item.encrypted_content, "gemini")
-    if not isinstance(state, dict):
-        return []
-    raw_signatures = state.get("thought_signatures")
-    if not isinstance(raw_signatures, list):
-        return []
-    decoded: list[bytes] = []
-    for raw_signature in raw_signatures:
-        if not isinstance(raw_signature, str):
-            continue
-        try:
-            decoded.append(base64.b64decode(raw_signature.encode("ascii"), validate=True))
-        except (binascii.Error, ValueError):
-            continue
-    return decoded
+def _user_content_to_completion_content(content: RequestContentLike) -> str | list[dict[str, object]] | None:
+    """Translate OpenResponses user content parts to Gemini-compatible chat content."""
+    parts = request_content_parts(content)
+    if not parts:
+        text = request_content_to_text(content)
+        return text or None
+
+    blocks: list[dict[str, object]] = []
+    for part in parts:
+        if isinstance(part, InputTextContentParam):
+            blocks.append({"type": "text", "text": part.text})
+        elif isinstance(part, InputImageContentParamAutoParam):
+            if part.image_url is not None:
+                blocks.append({"type": "image_url", "image_url": part.image_url.root})
+        elif isinstance(part, InputFileContentParam):
+            if part.file_data is not None:
+                blocks.append({"type": "file", "file": {"file_data": part.file_data.root}})
+            elif part.file_url is not None:
+                blocks.append({"type": "file", "file": {"file_data": part.file_url}})
+    if not blocks:
+        return None
+    if len(blocks) == 1 and blocks[0].get("type") == "text":
+        return cast("str", blocks[0].get("text", ""))
+    return blocks
 
 
-def _convert_request_input(
-    input_data: RequestInput,
-) -> tuple[list[types.Content], str | None]:
-    if isinstance(input_data, str):
-        return [types.Content(role="user", parts=[types.Part.from_text(text=input_data)])], None
+def request_input_to_completion_messages(input_data: RequestInput) -> list[dict[str, object]]:
+    """Convert OpenResponses input items to chat-completion messages for Gemini.
 
-    formatted_messages: list[types.Content] = []
+    Reasoning items contribute their decoded ``thought_signature`` to the next
+    ``function_call``'s ``extra_content``. Any reasoning state tagged with a
+    different provider (e.g. after a fallback) is silently ignored.
+    """
     system_parts: list[str] = []
-    function_names: dict[str, str] = {}
-    pending_signatures: list[bytes] = []
-    missing_signature_applied = False
+    messages: list[dict[str, object]] = []
+    pending_reasoning_text: str | None = None
+    pending_signature: str | None = None
+    pending_tool_calls: list[dict[str, object]] = []
+    tool_name_by_call_id: dict[str, str] = {}
 
-    for item in normalize_request_input(input_data):
-        if isinstance(item, ItemReferenceParam):
-            msg = "item_reference is not supported for gemini arequest"
-            raise InvalidRequestError(msg, provider_name="gemini")
+    def flush_tool_calls() -> None:
+        nonlocal pending_reasoning_text, pending_signature, pending_tool_calls
+        if not pending_tool_calls:
+            pending_reasoning_text = None
+            pending_signature = None
+            return
+        message: dict[str, object] = {"role": "assistant", "content": None, "tool_calls": pending_tool_calls}
+        if pending_reasoning_text:
+            message["reasoning"] = pending_reasoning_text
+        messages.append(message)
+        pending_reasoning_text = None
+        pending_signature = None
+        pending_tool_calls = []
+
+    for item in input_data:
         if isinstance(item, (SystemMessageItemParam, DeveloperMessageItemParam)):
-            text = _request_message_text(item.content)
+            text = request_content_to_text(item.content)
             if text:
                 system_parts.append(text)
-            continue
-        if isinstance(item, UserMessageItemParam):
-            formatted_messages.append(
-                types.Content(role="user", parts=[types.Part.from_text(text=_request_message_text(item.content))])
-            )
-            continue
-        if isinstance(item, AssistantMessageItemParam):
-            formatted_messages.append(
-                types.Content(role="model", parts=[types.Part.from_text(text=_request_message_text(item.content))])
-            )
-            continue
-        if isinstance(item, RequestReasoningItemParam):
-            pending_signatures = _decode_gemini_signatures(item)
-            continue
-        if isinstance(item, FunctionCallItemParam):
-            signature: bytes | str | None = None
-            if pending_signatures:
-                signature = pending_signatures.pop(0)
-            elif not missing_signature_applied:
-                signature = "skip_thought_signature_validator"
-                missing_signature_applied = True
+        elif isinstance(item, UserMessageItemParam):
+            flush_tool_calls()
+            content = _user_content_to_completion_content(item.content)
+            if content is not None:
+                messages.append({"role": "user", "content": content})
+        elif isinstance(item, AssistantMessageItemParam):
+            flush_tool_calls()
+            messages.append({"role": "assistant", "content": request_content_to_text(item.content) or None})
+        elif isinstance(item, ReasoningBody):
+            pending_reasoning_text = request_content_to_text(item.content)
+            pending_signature = decode_provider_state(item.encrypted_content, GEMINI)
+        elif isinstance(item, FunctionCallItemParam):
+            tool_name_by_call_id[item.call_id] = item.name
+            tool_call: dict[str, object] = {
+                "id": item.call_id,
+                "type": "function",
+                "function": {"name": item.name, "arguments": item.arguments},
+            }
+            extra_content: dict[str, object] | None = None
+            if pending_signature is not None:
+                extra_content = {"google": {"thought_signature": pending_signature}}
+                pending_signature = None
+            elif not pending_tool_calls:
+                # Per https://ai.google.dev/gemini-api/docs/thought-signatures, the first
+                # function call in a turn needs the skip-validator sentinel when there is
+                # no signature to forward.
+                extra_content = {"google": {"thought_signature": "skip_thought_signature_validator"}}
+            if extra_content is not None:
+                tool_call["extra_content"] = extra_content
+            pending_tool_calls.append(tool_call)
+        else:
+            flush_tool_calls()
+            tool_message: dict[str, object] = {
+                "role": "tool",
+                "tool_call_id": item.call_id,
+                "content": request_content_to_text(item.output),
+            }
+            tool_name = tool_name_by_call_id.get(item.call_id)
+            if tool_name is not None:
+                tool_message["name"] = tool_name
+            messages.append(tool_message)
 
-            function_names[item.call_id] = item.name
-            formatted_messages.append(
-                types.Content(
-                    role="model",
-                    parts=[
-                        types.Part(
-                            function_call=types.FunctionCall(name=item.name, args=json.loads(item.arguments)),
-                            thought_signature=signature,
-                        )
-                    ],
+    flush_tool_calls()
+    if system_parts:
+        return [{"role": "system", "content": "\n".join(system_parts)}, *messages]
+    return messages
+
+
+def _completion_to_request_response(completion: ChatCompletion, *, params: RequestParams) -> RequestResponse:
+    """Build a RequestResponse from a Gemini ChatCompletion, preserving thought signatures."""
+    output: list[OutputItem] = []
+    if completion.choices:
+        message = completion.choices[0].message
+        function_tool_calls = [
+            tool_call
+            for tool_call in (message.tool_calls or [])
+            if isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
+        ]
+        signature: str | None = None
+        for tool_call in function_tool_calls:
+            google_extra = tool_call.extra_content.get("google") if tool_call.extra_content else None
+            if not isinstance(google_extra, dict):
+                continue
+            thought_signature = google_extra.get("thought_signature")
+            if isinstance(thought_signature, str):
+                signature = thought_signature
+                break
+
+        encrypted = encode_provider_state(GEMINI, signature) if signature else None
+        if message.reasoning is not None or encrypted is not None:
+            output.append(
+                make_reasoning_item(
+                    message.reasoning.content if message.reasoning else None, encrypted_content=encrypted
                 )
             )
-            continue
-        if isinstance(item, FunctionCallOutputItemParam):
-            output = item.output
-            if isinstance(output, str):
-                try:
-                    normalized = json.loads(output)
-                except json.JSONDecodeError:
-                    normalized = {"result": output}
-            else:
-                normalized = {"result": _request_message_text(output)}
-            formatted_messages.append(
-                types.Content(
-                    role="function",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=function_names.get(item.call_id, "unknown"),
-                            response=_normalize_tool_response(normalized),
-                        )
-                    ],
-                )
-            )
-            continue
-
-    system_instruction = "\n".join(part for part in system_parts if part) or None
-    return formatted_messages, system_instruction
-
-
-def _convert_request_response(
-    response: types.GenerateContentResponse,
-    *,
-    params: RequestParams,
-) -> ResponseResource:
-    output_items: list[object] = []
-    if response.candidates:
-        candidate = response.candidates[0]
-        if candidate.content and candidate.content.parts:
-            pending_reasoning_text: list[str] = []
-
-            def flush_reasoning(signature: bytes | None = None) -> None:
-                if not pending_reasoning_text and signature is None:
-                    return
-                encrypted_content = None
-                if signature is not None:
-                    encrypted_content = encode_request_state(
-                        "gemini",
-                        {"thought_signatures": [base64.b64encode(signature).decode("ascii")]},
+        if function_tool_calls:
+            for tool_call in function_tool_calls:
+                output.append(
+                    make_function_call_item(
+                        call_id=tool_call.id, name=tool_call.function.name, arguments=tool_call.function.arguments
                     )
-                output_items.append(
-                    make_reasoning_item("".join(pending_reasoning_text) or None, encrypted_content=encrypted_content)
                 )
-                pending_reasoning_text.clear()
+        if message.content:
+            output.append(make_text_message(message.content))
 
-            for part in candidate.content.parts:
-                if part.thought:
-                    pending_reasoning_text.append(part.text or "")
-                    continue
-                if function_call := part.function_call:
-                    flush_reasoning(part.thought_signature if isinstance(part.thought_signature, bytes) else None)
-                    output_items.append(
-                        make_function_call_item(
-                            call_id=f"call_{hash(function_call.name)}_{len(output_items)}",
-                            name=function_call.name or "",
-                            arguments=json.dumps(function_call.args or {}),
-                        )
-                    )
-                    continue
-                if part.text:
-                    flush_reasoning()
-                    output_items.append(make_text_message(part.text))
-
-            flush_reasoning()
-
-    cached_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    reasoning_tokens = 0
-    if response.usage_metadata is not None:
-        cached_tokens = response.usage_metadata.cached_content_token_count or 0
-        input_tokens = response.usage_metadata.prompt_token_count or 0
-        output_tokens = response.usage_metadata.candidates_token_count or 0
-        reasoning_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
-
-    reasoning_cfg = None
-    if params.reasoning is not None:
-        reasoning_cfg = ResponseReasoningConfig(
-            effort=cast("Any", params.reasoning.get("effort")),
-            summary=cast("Any", params.reasoning.get("summary")),
+    if completion.usage is not None:
+        input_tokens = completion.usage.prompt_tokens or 0
+        output_tokens = completion.usage.completion_tokens or 0
+        usage = Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            input_tokens_details=InputTokensDetails(
+                cached_tokens=d.cached_tokens or 0 if (d := completion.usage.prompt_tokens_details) else 0
+            ),
+            output_tokens_details=OutputTokensDetails(
+                reasoning_tokens=d.reasoning_tokens or 0 if (d := completion.usage.completion_tokens_details) else 0
+            ),
+        )
+    else:
+        usage = Usage(
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            input_tokens_details=InputTokensDetails(cached_tokens=0),
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         )
 
-    return make_response_resource(
-        model=str(response.model_version or params.model),
-        output=cast("list[Any]", output_items),
+    resource = make_response_resource(
+        model=completion.model or params.model,
+        output=output,
         tools=params.tools,
         tool_choice=params.tool_choice,
         temperature=params.temperature,
         top_p=params.top_p,
         max_output_tokens=params.max_output_tokens,
-        reasoning=reasoning_cfg,
-        usage=make_usage(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cached_tokens=cached_tokens,
-            reasoning_tokens=reasoning_tokens,
-        ),
+        reasoning=params.reasoning,
+        usage=usage,
         instructions=params.instructions,
         metadata=params.metadata,
     )
+    return finalize_request_response(resource, response_format=params.response_format)

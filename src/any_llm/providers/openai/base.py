@@ -22,6 +22,8 @@ from any_llm.providers.openai.utils import (
     _convert_chat_completion,
     _convert_parsed_chat_completion,
     _normalize_openai_dict_response,
+    split_request_input_for_openai,
+    stamp_openai_response_state,
 )
 from any_llm.types.batch import Batch, BatchResult, BatchResultError, BatchResultItem
 from any_llm.types.completion import (
@@ -32,7 +34,7 @@ from any_llm.types.completion import (
     ReasoningEffort,
 )
 from any_llm.types.model import Model
-from any_llm.types.request import RequestParams, RequestResponse, RequestStreamEvent
+from any_llm.types.request import RequestParams, RequestResponse
 from any_llm.types.responses import Response, ResponsesParams, ResponseStreamEvent
 from any_llm.utils.structured_output import get_json_schema, is_structured_output_type
 
@@ -238,35 +240,42 @@ class BaseOpenAIProvider(AnyLLM):
         return response
 
     @override
-    async def _arequest(
-        self, params: RequestParams, **kwargs: Any
-    ) -> RequestResponse | AsyncIterator[RequestStreamEvent]:
-        response = await self._aresponses(
-            ResponsesParams(
-                model=params.model,
-                input=params.input,
-                tools=params.tools,
-                tool_choice=params.tool_choice,
-                max_output_tokens=params.max_output_tokens,
-                temperature=params.temperature,
-                top_p=params.top_p,
-                stream=params.stream,
-                instructions=params.instructions,
-                reasoning=params.reasoning,
-                metadata=params.metadata,
-            ),
-            **kwargs,
+    async def _arequest(self, params: RequestParams, **kwargs: Any) -> RequestResponse:
+        """Route a request through the OpenAI Responses API.
+
+        Cross-family reasoning items are dropped; OpenAI-tagged ones are
+        consumed for ``previous_response_id`` continuity.
+        """
+        responses_input, previous_response_id = split_request_input_for_openai(params.input)
+        responses_params = ResponsesParams(
+            model=params.model,
+            input=cast("Any", responses_input),
+            tools=cast("Any", params.tools),
+            tool_choice=params.tool_choice,
+            max_output_tokens=params.max_output_tokens,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            instructions=params.instructions,
+            parallel_tool_calls=params.parallel_tool_calls,
+            reasoning=params.reasoning.model_dump(mode="json", exclude_none=True) if params.reasoning else None,
+            presence_penalty=params.presence_penalty,
+            frequency_penalty=params.frequency_penalty,
+            metadata=params.metadata,
+            previous_response_id=previous_response_id,
         )
-        if isinstance(response, AsyncStream):
-            return cast("AsyncIterator[RequestStreamEvent]", response)
+        response = await self._aresponses(responses_params, **kwargs)
         if isinstance(response, Response):
             try:
-                return ResponseResource.model_validate(response.model_dump(warnings=False))
+                resource = ResponseResource.model_validate(response.model_dump(warnings=False))
             except ValidationError as e:
-                msg = f"Failed to convert Response to OpenResponse ResponseResource: {e}"
-                logger.info(msg)
+                msg = f"Failed to convert Response to ResponseResource: {e}"
                 raise ValueError(msg) from e
-        return response
+        elif isinstance(response, ResponseResource):
+            resource = response
+        else:
+            msg = f"Unexpected aresponses return type for arequest: {type(response).__name__}"
+            raise TypeError(msg)
+        return stamp_openai_response_state(resource, params)
 
     @override
     async def _aembedding(

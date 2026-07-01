@@ -4,11 +4,19 @@ from typing import Any
 
 from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
 from openai.types.chat.parsed_chat_completion import ParsedChatCompletion as OpenAIParsedChatCompletion
+from openresponses_types import ResponseResource
+from openresponses_types.types import ReasoningBody
 
 from any_llm.constants import REASONING_FIELD_NAMES
 from any_llm.exceptions import ProviderError
 from any_llm.logging import logger
 from any_llm.types.completion import ChatCompletion, ParsedChatCompletion
+from any_llm.types.request import RequestInput, RequestInputItemParam, RequestParams, RequestResponse
+from any_llm.utils.openresponses_compat import dump_json_model
+from any_llm.utils.request_output import finalize_request_response, make_reasoning_item
+from any_llm.utils.request_state import OPENAI, decode_provider_state, encode_provider_state
+
+REASONING_FAMILY = OPENAI
 
 
 def _normalize_reasoning_on_message(message_dict: dict[str, Any]) -> None:
@@ -89,3 +97,45 @@ def _convert_parsed_chat_completion(response: OpenAIParsedChatCompletion[Any]) -
     for base_choice, parsed_choice in zip(response.choices, parsed_completion.choices, strict=True):
         parsed_choice.message.parsed = base_choice.message.parsed
     return parsed_completion
+
+
+def _latest_response_state(items: list[RequestInputItemParam]):
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if isinstance(item, ReasoningBody):
+            state = decode_provider_state(item.encrypted_content, REASONING_FAMILY)
+            if state is not None:
+                return index, state
+
+    return None, None
+
+
+def split_request_input_for_openai(input_data: RequestInput) -> tuple[list[dict[str, object]], str | None]:
+    """Strip cross-family reasoning items and extract any cached previous_response_id.
+
+    Returns the OpenAI-ready list of input items and the latest
+    ``previous_response_id`` we encoded in a prior turn (or ``None``).
+    """
+    last_state_index, previous_response_id = _latest_response_state(input_data)
+
+    if last_state_index is None:
+        # No prior state: forward everything except cross-family reasoning items.
+        return [dump_json_model(item) for item in input_data if not isinstance(item, ReasoningBody)], None
+
+    # OpenAI replays the prior turn server-side, so only forward what is new and drop the rest
+    return [
+        dump_json_model(item)
+        for item in input_data[last_state_index + 1 :]
+        if item.type == "function_call_output" or (item.type == "message" and item.role == "user")
+    ], previous_response_id
+
+
+def stamp_openai_response_state(resource: ResponseResource, params: RequestParams) -> RequestResponse:
+    """Append a trailing reasoning item carrying the response id for next-turn continuity."""
+    payload = resource.model_dump(mode="json", by_alias=True, exclude_none=False)
+    output = [
+        *resource.output,
+        make_reasoning_item(text=None, encrypted_content=encode_provider_state(REASONING_FAMILY, resource.id)),
+    ]
+    payload["output"] = [dump_json_model(item) for item in output]
+    return finalize_request_response(ResponseResource.model_validate(payload), response_format=params.response_format)

@@ -15,7 +15,13 @@ from any_llm.types.completion import (
 )
 from any_llm.types.messages import MessageResponse, MessageStreamEvent
 from any_llm.types.model import Model
-from any_llm.types.request import RequestInput, RequestResponse, RequestStreamEvent
+from any_llm.types.request import (
+    RequestInput,
+    RequestReasoningParam,
+    RequestResponse,
+    RequestResponseFormatParam,
+    RequestToolChoiceParam,
+)
 from any_llm.types.responses import Response, ResponseInputParam, ResponseStreamEvent
 
 
@@ -379,19 +385,25 @@ def request(
     *,
     provider: str | LLMProvider | None = None,
     tools: list[dict[str, Any] | Callable[..., Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
+    tool_choice: RequestToolChoiceParam | None = None,
     max_output_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
     stream: bool | None = None,
+    response_format: RequestResponseFormatParam | None = None,
+    stop: str | list[str] | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
+    seed: int | None = None,
+    parallel_tool_calls: bool | None = None,
     api_key: str | None = None,
     api_base: str | None = None,
     instructions: str | None = None,
-    reasoning: dict[str, Any] | None = None,
+    reasoning: RequestReasoningParam | None = None,
     metadata: dict[str, str] | None = None,
     client_args: dict[str, Any] | None = None,
     **kwargs: Any,
-) -> RequestResponse | Iterator[RequestStreamEvent]:
+) -> RequestResponse:
     """Create a response using the experimental stateful request API."""
     if provider is None:
         provider_key, model_id = AnyLLM.split_model_provider(model)
@@ -399,12 +411,7 @@ def request(
         provider_key = LLMProvider.from_string(provider)
         model_id = model
 
-    llm = AnyLLM.create(
-        provider_key,
-        api_key=api_key,
-        api_base=api_base,
-        **client_args or {},
-    )
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
     return llm.request(
         model=model_id,
         input_data=input_data,
@@ -414,6 +421,12 @@ def request(
         temperature=temperature,
         top_p=top_p,
         stream=stream,
+        response_format=response_format,
+        stop=stop,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        seed=seed,
+        parallel_tool_calls=parallel_tool_calls,
         instructions=instructions,
         reasoning=reasoning,
         metadata=metadata,
@@ -561,19 +574,25 @@ async def arequest(
     *,
     provider: str | LLMProvider | None = None,
     tools: list[dict[str, Any] | Callable[..., Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
+    tool_choice: RequestToolChoiceParam | None = None,
     max_output_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
     stream: bool | None = None,
+    response_format: RequestResponseFormatParam | None = None,
+    stop: str | list[str] | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
+    seed: int | None = None,
+    parallel_tool_calls: bool | None = None,
     api_key: str | None = None,
     api_base: str | None = None,
     instructions: str | None = None,
-    reasoning: dict[str, Any] | None = None,
+    reasoning: RequestReasoningParam | None = None,
     metadata: dict[str, str] | None = None,
     client_args: dict[str, Any] | None = None,
     **kwargs: Any,
-) -> RequestResponse | AsyncIterator[RequestStreamEvent]:
+) -> RequestResponse:
     """Create a response using the experimental stateful request API asynchronously."""
     if provider is None:
         provider_key, model_id = AnyLLM.split_model_provider(model)
@@ -581,12 +600,7 @@ async def arequest(
         provider_key = LLMProvider.from_string(provider)
         model_id = model
 
-    llm = AnyLLM.create(
-        provider_key,
-        api_key=api_key,
-        api_base=api_base,
-        **client_args or {},
-    )
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
     return await llm.arequest(
         model=model_id,
         input_data=input_data,
@@ -596,6 +610,12 @@ async def arequest(
         temperature=temperature,
         top_p=top_p,
         stream=stream,
+        response_format=response_format,
+        stop=stop,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        seed=seed,
+        parallel_tool_calls=parallel_tool_calls,
         instructions=instructions,
         reasoning=reasoning,
         metadata=metadata,

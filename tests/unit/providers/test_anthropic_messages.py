@@ -1,7 +1,7 @@
 """Tests for Anthropic provider native Messages API pass-through."""
 
 from typing import Any, Self
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from anthropic.types import Message, TextBlock, ThinkingBlock, ToolUseBlock, Usage
@@ -19,7 +19,7 @@ from any_llm.types.messages import (
     MessageStopEvent,
 )
 from any_llm.types.request import RequestParams
-from any_llm.utils.request_state import encode_request_state
+from any_llm.utils.request_state import CLAUDE, GEMINI, encode_provider_state
 
 
 def _make_usage(**overrides: Any) -> Usage:
@@ -412,7 +412,7 @@ def test_convert_request_input_restores_thinking_signature() -> None:
                 "type": "reasoning",
                 "summary": [],
                 "content": [{"type": "reasoning_text", "text": "Let me think"}],
-                "encrypted_content": encode_request_state("anthropic", {"signature": "sig_123"}),
+                "encrypted_content": encode_provider_state(CLAUDE, "sig_123"),
             },
             {
                 "type": "function_call",
@@ -440,7 +440,7 @@ def test_convert_request_input_ignores_foreign_state() -> None:
                 "type": "reasoning",
                 "summary": [],
                 "content": [{"type": "reasoning_text", "text": "Foreign"}],
-                "encrypted_content": encode_request_state("gemini", {"thought_signatures": ["abc"]}),
+                "encrypted_content": encode_provider_state(GEMINI, "thought-sig"),
             }
         ],
         None,
@@ -448,8 +448,27 @@ def test_convert_request_input_ignores_foreign_state() -> None:
     assert messages[0]["content"][0]["type"] == "text"
 
 
+def test_convert_request_input_extracts_text_from_normalized_user_parts() -> None:
+    _, messages = _convert_request_input(
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello from user"}],
+            }
+        ],
+        None,
+    )
+
+    assert messages == [{"role": "user", "content": "Hello from user"}]
+
+
 def test_convert_request_response_preserves_signature() -> None:
-    params = RequestParams(model="claude-sonnet-4-6", input="Hello", reasoning={"effort": "medium"})
+    params = RequestParams(
+        model="claude-sonnet-4-6",
+        input=[{"type": "message", "role": "user", "content": "Hello"}],
+        reasoning={"effort": "medium"},
+    )
     message = _make_message(
         content=[
             ThinkingBlock(type="thinking", thinking="Let me reason...", signature="sig"),
@@ -474,29 +493,60 @@ async def test_arequest_non_streaming() -> None:
     mock_client.messages.create = AsyncMock(return_value=mock_message)
 
     provider = Mock(spec=BaseAnthropicProvider)
+    provider.PROVIDER_NAME = "anthropic"
     provider.client = mock_client
 
     params = RequestParams(
         model="claude-sonnet-4-6",
-        input="Hello",
+        input=[{"type": "message", "role": "user", "content": "Hello"}],
         stream=False,
+        reasoning={"effort": "medium"},
     )
     result = await BaseAnthropicProvider._arequest(provider, params)
     assert result.output[0].type == "reasoning"
+    mock_client.messages.create.assert_called_once()
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    assert "reasoning" not in call_kwargs
+    assert call_kwargs["thinking"]["type"] == "adaptive"
+    assert call_kwargs["output_config"]["effort"] == "medium"
 
 
 @pytest.mark.asyncio
-async def test_arequest_streaming_returns_events() -> None:
+async def test_arequest_downgrades_forced_tool_choice_with_thinking() -> None:
     mock_message = _make_message(content=[TextBlock(type="text", text="Hi!")])
     mock_client = Mock()
     mock_client.messages.create = AsyncMock(return_value=mock_message)
 
     provider = Mock(spec=BaseAnthropicProvider)
+    provider.PROVIDER_NAME = "anthropic"
     provider.client = mock_client
-    provider._stream_request_async = BaseAnthropicProvider._stream_request_async.__get__(provider, BaseAnthropicProvider)
 
-    params = RequestParams(model="claude-sonnet-4-6", input="Hello", stream=True)
-    stream = await BaseAnthropicProvider._arequest(provider, params)
-    events = [event async for event in stream]
-    assert events[0].type == "response.created"
-    assert events[-1].type == "response.completed"
+    params = RequestParams(
+        model="claude-sonnet-4-6",
+        input=[{"type": "message", "role": "user", "content": "Hello"}],
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        tool_choice="required",
+        reasoning={"effort": "medium"},
+    )
+
+    with patch("any_llm.providers.anthropic.utils.logger.warning") as mock_warning:
+        await BaseAnthropicProvider._arequest(provider, params)
+
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    assert call_kwargs["tool_choice"]["type"] == "auto"
+    assert call_kwargs["thinking"]["type"] == "adaptive"
+    assert call_kwargs["output_config"]["effort"] == "medium"
+    assert mock_warning.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_arequest_rejects_streaming() -> None:
+    provider = Mock(spec=BaseAnthropicProvider)
+    provider.PROVIDER_NAME = "anthropic"
+    params = RequestParams(
+        model="claude-sonnet-4-6",
+        input=[{"type": "message", "role": "user", "content": "Hello"}],
+        stream=True,
+    )
+    with pytest.raises(NotImplementedError, match="Streaming is not yet implemented for arequest"):
+        await BaseAnthropicProvider._arequest(provider, params)
