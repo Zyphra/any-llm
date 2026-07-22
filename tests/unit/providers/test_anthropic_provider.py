@@ -772,7 +772,10 @@ def test_convert_response_includes_cache_creation_tokens() -> None:
     assert result.usage is not None
     assert result.usage.prompt_tokens == expected_prompt_tokens
     assert result.usage.total_tokens == expected_total_tokens
-    assert result.usage.prompt_tokens_details is None
+    assert result.usage.prompt_tokens_details is not None
+    assert result.usage.prompt_tokens_details.cached_tokens is None
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 13332
 
 
 def test_convert_response_without_cache_tokens() -> None:
@@ -815,7 +818,7 @@ def test_streaming_chunk_includes_cache_tokens_in_usage() -> None:
         input_tokens=3,
         output_tokens=159,
         cache_read_input_tokens=13332,
-        cache_creation_input_tokens=0,
+        cache_creation_input_tokens=1024,
     )
 
     mock_message = MagicMock()
@@ -826,7 +829,7 @@ def test_streaming_chunk_includes_cache_tokens_in_usage() -> None:
 
     result = _create_openai_chunk_from_anthropic_chunk(chunk, "claude-3-haiku")
 
-    expected_prompt_tokens = 3 + 13332 + 0
+    expected_prompt_tokens = 3 + 13332 + 1024
     expected_total_tokens = expected_prompt_tokens + 159
 
     assert result.usage is not None
@@ -835,6 +838,8 @@ def test_streaming_chunk_includes_cache_tokens_in_usage() -> None:
     assert result.usage.total_tokens == expected_total_tokens
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 13332
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 1024
 
 
 @pytest.mark.asyncio

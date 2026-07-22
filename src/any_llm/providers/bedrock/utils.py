@@ -303,11 +303,21 @@ def _extract_usage(usage_data: dict[str, Any]) -> CompletionUsage:
     input_tokens = usage_data.get("inputTokens", 0)
     prompt_tokens = input_tokens + cache_read + cache_write
     output_tokens = usage_data.get("outputTokens", 0)
+    prompt_tokens_details = (
+        PromptTokensDetails.model_validate(
+            {
+                "cached_tokens": cache_read or None,
+                "cache_write_tokens": cache_write or None,
+            }
+        )
+        if cache_read or cache_write
+        else None
+    )
     return CompletionUsage(
         completion_tokens=output_tokens,
         prompt_tokens=prompt_tokens,
         total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens_details=PromptTokensDetails(cached_tokens=cache_read) if cache_read else None,
+        prompt_tokens_details=prompt_tokens_details,
     )
 
 

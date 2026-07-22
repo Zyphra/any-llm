@@ -2,7 +2,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk as OpenAIChatCompletionChunk
 
+from any_llm.exceptions import ProviderError
 from any_llm.providers.openrouter import OpenrouterProvider
 from any_llm.providers.openrouter.utils import _convert_models_list
 from any_llm.types.completion import (
@@ -13,6 +16,114 @@ from any_llm.types.completion import (
     Reasoning,
 )
 from any_llm.types.model import Model
+
+
+def test_completion_response_preserves_cache_write_tokens() -> None:
+    response = OpenAIChatCompletion.model_validate(
+        {
+            "id": "test-cache-write",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Hello"},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": {
+                    "cached_tokens": 80,
+                    "cache_write_tokens": 20,
+                },
+            },
+        }
+    )
+
+    result = OpenrouterProvider._convert_completion_response(response)
+
+    assert result.usage is not None
+    assert result.usage.prompt_tokens_details is not None
+    assert result.usage.prompt_tokens_details.cached_tokens == 80
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+
+
+def test_completion_chunk_preserves_cache_write_tokens() -> None:
+    response = OpenAIChatCompletionChunk.model_validate(
+        {
+            "id": "test-cache-write",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": {
+                    "cached_tokens": 80,
+                    "cache_write_tokens": 20,
+                },
+            },
+        }
+    )
+
+    result = OpenrouterProvider._convert_completion_chunk_response(response)
+
+    assert result.usage is not None
+    assert result.usage.prompt_tokens_details is not None
+    assert result.usage.prompt_tokens_details.cached_tokens == 80
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+
+
+def test_completion_response_raises_for_terminal_error() -> None:
+    response = OpenAIChatCompletion.model_construct(
+        id="test-error",
+        object="chat.completion",
+        created=1234567890,
+        model="test-model",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "error",
+                "message": {"role": "assistant", "content": "Partial response"},
+                "error": {
+                    "code": 502,
+                    "message": "Provider disconnected",
+                    "metadata": {"error_type": "provider_unavailable"},
+                },
+            }
+        ],
+    )
+
+    with pytest.raises(ProviderError, match="OpenRouter request terminated with an error") as exc:
+        OpenrouterProvider._convert_completion_response(response)
+
+    assert exc.value.provider_name == "openrouter"
+
+
+def test_completion_chunk_raises_for_terminal_error() -> None:
+    response = OpenAIChatCompletionChunk.model_construct(
+        id="test-error",
+        object="chat.completion.chunk",
+        created=1234567890,
+        model="test-model",
+        choices=[{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+        error={
+            "code": 502,
+            "message": "Provider disconnected",
+            "metadata": {"error_type": "provider_unavailable"},
+        },
+    )
+
+    with pytest.raises(ProviderError, match="OpenRouter request terminated with an error"):
+        OpenrouterProvider._convert_completion_chunk_response(response)
 
 
 @pytest.mark.asyncio
@@ -257,11 +368,22 @@ async def test_streaming_with_reasoning() -> None:
         assert call_args.kwargs["extra_body"]["reasoning"]["effort"] == "high"
 
 
-def test_openrouter_remaps_max_tokens_to_max_completion_tokens() -> None:
+def test_openrouter_preserves_max_tokens() -> None:
     params = CompletionParams(model_id="openai/gpt-4", messages=[{"role": "user", "content": "Hello"}], max_tokens=8192)
     result = OpenrouterProvider._convert_completion_params(params)
-    assert "max_tokens" not in result
+    assert result["max_tokens"] == 8192
+    assert "max_completion_tokens" not in result
+
+
+def test_openrouter_preserves_max_completion_tokens() -> None:
+    params = CompletionParams(
+        model_id="openai/gpt-4",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_completion_tokens=8192,
+    )
+    result = OpenrouterProvider._convert_completion_params(params)
     assert result["max_completion_tokens"] == 8192
+    assert "max_tokens" not in result
 
 
 def _make_openrouter_model(**overrides: object) -> Model:

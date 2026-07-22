@@ -624,8 +624,8 @@ def test_completion_with_images() -> None:
         assert call_args["messages"][0]["content"][1]["image"]["source"]["bytes"] == test_image_data
 
 
-def test_convert_response_extracts_cached_tokens() -> None:
-    """Test that cacheReadInputTokens is extracted into prompt_tokens_details."""
+def test_convert_response_extracts_cache_write_tokens() -> None:
+    """Test that cacheWriteInputTokens is extracted without cache reads."""
     response: dict[str, Any] = {
         "output": {"message": {"content": [{"text": "Hello!"}]}},
         "stopReason": "end_turn",
@@ -633,7 +633,6 @@ def test_convert_response_extracts_cached_tokens() -> None:
             "inputTokens": 100,
             "outputTokens": 50,
             "totalTokens": 150,
-            "cacheReadInputTokens": 80,
             "cacheWriteInputTokens": 20,
         },
     }
@@ -641,11 +640,13 @@ def test_convert_response_extracts_cached_tokens() -> None:
     result = _convert_response(response)
 
     assert result.usage is not None
-    assert result.usage.prompt_tokens == 200  # 100 + 80 + 20
+    assert result.usage.prompt_tokens == 120  # 100 + 20
     assert result.usage.completion_tokens == 50
-    assert result.usage.total_tokens == 250  # 200 + 50
+    assert result.usage.total_tokens == 170  # 120 + 50
     assert result.usage.prompt_tokens_details is not None
-    assert result.usage.prompt_tokens_details.cached_tokens == 80
+    assert result.usage.prompt_tokens_details.cached_tokens is None
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
 
 
 def test_convert_response_without_cached_tokens() -> None:
@@ -725,6 +726,8 @@ def test_streaming_metadata_chunk_extracts_cached_tokens() -> None:
     assert result.usage.total_tokens == 250
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
+    assert result.usage.prompt_tokens_details.model_extra is not None
+    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
 
 
 def test_streaming_metadata_chunk_without_cached_tokens() -> None:
