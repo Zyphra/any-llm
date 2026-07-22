@@ -3,10 +3,18 @@ from typing import Any
 
 from typing_extensions import override
 
+from any_llm.exceptions import ProviderError
 from any_llm.providers.openai.base import BaseOpenAIProvider
 from any_llm.providers.openrouter.utils import _convert_models_list, build_reasoning_directive
-from any_llm.types.completion import CompletionParams
+from any_llm.types.completion import ChatCompletion, ChatCompletionChunk, CompletionParams
 from any_llm.types.model import Model
+
+
+def _raise_for_error_finish_reason(response: Any) -> None:
+    payload = response if isinstance(response, dict) else response.model_dump(warnings=False)
+    if any(choice.get("finish_reason") == "error" for choice in payload.get("choices") or []):
+        msg = "OpenRouter request terminated with an error"
+        raise ProviderError(msg, provider_name="openrouter")
 
 
 class OpenrouterProvider(BaseOpenAIProvider):
@@ -32,9 +40,26 @@ class OpenrouterProvider(BaseOpenAIProvider):
 
     @staticmethod
     @override
+    def _convert_completion_response(response: Any) -> ChatCompletion:
+        _raise_for_error_finish_reason(response)
+        return BaseOpenAIProvider._convert_completion_response(response)
+
+    @staticmethod
+    @override
+    def _convert_completion_chunk_response(response: Any, **kwargs: Any) -> ChatCompletionChunk:
+        _raise_for_error_finish_reason(response)
+        return BaseOpenAIProvider._convert_completion_chunk_response(response, **kwargs)
+
+    @staticmethod
+    @override
     def _convert_completion_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
         """Convert CompletionParams to kwargs for OpenRouter API, including reasoning directive."""
+        max_tokens = kwargs.get("max_tokens", params.max_tokens)
+        max_completion_tokens = kwargs.get("max_completion_tokens", params.max_completion_tokens)
         converted_params = BaseOpenAIProvider._convert_completion_params(params, **kwargs)
+
+        if max_tokens is not None and max_completion_tokens is None:
+            converted_params["max_tokens"] = converted_params.pop("max_completion_tokens")
 
         reasoning_directive = build_reasoning_directive(
             reasoning=kwargs.get("reasoning"),
