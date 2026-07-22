@@ -46,6 +46,7 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.FIREWORKS: "accounts/fireworks/models/gpt-oss-20b",
         LLMProvider.OPENAI: "gpt-5-nano",
         LLMProvider.MISTRAL: "magistral-medium-latest",
+        LLMProvider.GMI: "zai-org/GLM-5-FP8",
         LLMProvider.XAI: "grok-3-mini-latest",
         LLMProvider.OLLAMA: "qwen3:0.6b",
         LLMProvider.OPENROUTER: "google/gemini-2.5-flash-lite",
@@ -58,7 +59,10 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.AZUREOPENAI: "gpt-4.1-nano",
         LLMProvider.CEREBRAS: "gpt-oss-120b",
         LLMProvider.COHERE: "command-a-reasoning-08-2025",
-        LLMProvider.DEEPSEEK: "deepseek-reasoner",
+        # deepseek-reasoner is discontinued 2026-07-24 in favor of deepseek-v4-flash, where
+        # thinking mode is now a request-level toggle (see DeepseekProvider._convert_completion_params)
+        # rather than a dedicated model name.
+        LLMProvider.DEEPSEEK: "deepseek-v4-flash",
         # kimi-k2-thinking and kimi-thinking-preview are discontinued; kimi-k2.6 is the
         # current reasoning-capable model (thinking mode, native multimodal).
         LLMProvider.MOONSHOT: "kimi-k2.6",
@@ -72,6 +76,7 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.MINIMAX: "MiniMax-M2",
         LLMProvider.ZAI: "glm-4.5-flash",
         LLMProvider.DEEPINFRA: "deepseek-ai/DeepSeek-R1",
+        LLMProvider.TELNYX: "moonshotai/Kimi-K2.6",
     }
 
 
@@ -81,11 +86,15 @@ def provider_model_map() -> dict[LLMProvider, str]:
     return {
         LLMProvider.MISTRAL: "mistral-small-latest",
         LLMProvider.ANTHROPIC: "claude-haiku-4-5",
-        LLMProvider.DEEPSEEK: "deepseek-chat",
+        # deepseek-chat is discontinued 2026-07-24 in favor of deepseek-v4-flash; thinking mode
+        # defaults to disabled for it unless reasoning_effort is set (see
+        # DeepseekProvider._convert_completion_params), matching the old deepseek-chat behavior.
+        LLMProvider.DEEPSEEK: "deepseek-v4-flash",
         LLMProvider.OPENAI: "gpt-5-nano",
         # otari routes provider:model; anthropic is the only upstream the test account serves reliably.
         LLMProvider.OTARI: "anthropic:claude-haiku-4-5",
         LLMProvider.GEMINI: "gemini-3-flash-preview",
+        LLMProvider.GMI: "zai-org/GLM-5-FP8",
         LLMProvider.GITHUB: "openai/gpt-4.1-nano",
         LLMProvider.VERTEXAI: "gemini-3-flash-preview",
         LLMProvider.MOONSHOT: "moonshot-v1-8k",
@@ -119,6 +128,8 @@ def provider_model_map() -> dict[LLMProvider, str]:
         LLMProvider.MINIMAX: "MiniMax-M2",
         LLMProvider.ZAI: "glm-4-32b-0414-128k",
         LLMProvider.DEEPINFRA: "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        LLMProvider.EDENAI: "openai/gpt-4o-mini",
+        LLMProvider.TELNYX: "meta-llama/Meta-Llama-3.1-8B-Instruct",
     }
 
 
@@ -133,7 +144,7 @@ def provider_image_model_map(provider_model_map: dict[LLMProvider, str]) -> dict
         LLMProvider.OPENROUTER: "google/gemini-2.5-flash-lite",
         LLMProvider.COHERE: "command-a-vision-07-2025",  # command-a-03-2025 rejects image content
         LLMProvider.OLLAMA: "llava-phi3",  # Fast vision model compatible with OpenAI format
-        LLMProvider.FIREWORKS: "accounts/fireworks/models/kimi-k2p5",
+        LLMProvider.FIREWORKS: "accounts/fireworks/models/kimi-k2p6",
         LLMProvider.BEDROCK: "anthropic.claude-3-haiku-20240307-v1:0",  # Claude 3 Haiku with vision support
         LLMProvider.NEOSANTARA: "gemini-3-flash-preview",  # Vision model compatible with OpenAI format
     }
@@ -165,6 +176,7 @@ def embedding_provider_model_map() -> dict[LLMProvider, str]:
         LLMProvider.AZUREOPENAI: "gpt-4.1-nano",  # Not an embedding model but it's the only one we have deployed in Azure OpenAI
         LLMProvider.OPENROUTER: "qwen/qwen3-embedding-8b",
         LLMProvider.DEEPINFRA: "BAAI/bge-base-en-v1.5",
+        LLMProvider.EDENAI: "openai/text-embedding-3-small",
     }
 
 

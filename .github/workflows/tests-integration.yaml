@@ -60,7 +60,7 @@ jobs:
       should_run_integration: ${{ steps.determine.outputs.should_run_integration }}
       should_run_local: ${{ steps.determine.outputs.should_run_local }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -132,7 +132,7 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -156,7 +156,7 @@ jobs:
         run: |
           uv sync --group tests --extra all
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         if: github.event.inputs.filter == '' || contains(github.event.inputs.filter, 'ollama')
         with:
           path: ~/.ollama
@@ -164,14 +164,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ollama-models-
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.llamafile
           key: ${{ runner.os }}-llamafile-${{ hashFiles('tests/conftest.py') }}
           restore-keys: |
             ${{ runner.os }}-llamafile-
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         if: github.event.inputs.filter == '' || contains(github.event.inputs.filter, 'lmstudio')
         with:
           path: ~/.lmstudio
@@ -267,6 +267,6 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

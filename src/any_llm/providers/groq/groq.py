@@ -71,8 +71,10 @@ class GroqProvider(AnyLLM):
     @override
     def _convert_completion_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
         """Convert CompletionParams to kwargs for Groq API."""
-        # Groq does not support providing reasoning effort
-        converted_params = params.model_dump(exclude_none=True, exclude={"model_id", "messages"})
+        # Groq does not support providing reasoning effort.
+        # stream_options is an OpenAI-only knob (the Messages bridge sets it to
+        # request streaming usage); the Groq SDK rejects it, so drop it here.
+        converted_params = params.model_dump(exclude_none=True, exclude={"model_id", "messages", "stream_options"})
         if converted_params.get("reasoning_effort") in ("auto", "none"):
             converted_params.pop("reasoning_effort")
         converted_params.update(kwargs)
@@ -119,6 +121,8 @@ class GroqProvider(AnyLLM):
     async def _stream_async_completion(
         self, params: CompletionParams, **kwargs: Any
     ) -> AsyncIterator[ChatCompletionChunk]:
+        # Groq does not currently support streaming structured outputs.
+        # See https://console.groq.com/docs/structured-outputs
         if params.stream and params.response_format:
             msg = "stream and response_format"
             raise UnsupportedParameterError(msg, self.PROVIDER_NAME)

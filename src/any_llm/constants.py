@@ -30,6 +30,7 @@ class LLMProvider(StrEnum):
     FIREWORKS = "fireworks"
     GEMINI = "gemini"
     GITHUB = "github"
+    GMI = "gmi"
     GROQ = "groq"
     HUGGINGFACE = "huggingface"
     INCEPTION = "inception"
@@ -62,7 +63,9 @@ class LLMProvider(StrEnum):
     MINIMAX = "minimax"
     DASHSCOPE = "dashscope"
     DEEPINFRA = "deepinfra"
+    EDENAI = "edenai"
     ZAI = "zai"
+    TELNYX = "telnyx"
 
     @classmethod
     def from_string(cls, value: "str | LLMProvider") -> "LLMProvider":

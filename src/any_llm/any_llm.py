@@ -37,12 +37,14 @@ from any_llm.types.messages import (
     MessageStopEvent,
     MessageStreamEvent,
     ParsedMessage,
+    StopReason,
 )
 from any_llm.types.provider import ProviderMetadata
 from any_llm.types.responses import (
     ParsedResponse,
     Response,
-    ResponseInputParam,
+    ResponseInput,
+    ResponseInputPayload,
     ResponsesParams,
     ResponseStreamEvent,
 )
@@ -785,29 +787,37 @@ class AnyLLM(ABC):
 
         async def convert_stream() -> AsyncIterator[MessageStreamEvent]:
             state = StreamingState()
-            emitted_stop = False
-            async for chunk in result:
-                events = chat_completion_chunk_to_message_stream_events(chunk, state)
-                for event in events:
-                    if isinstance(event, MessageStopEvent):
-                        emitted_stop = True
-                    yield event
-            # Some providers don't send a final chunk with finish_reason,
-            # so ensure the stream always ends with message_stop.
-            if state.started and not emitted_stop:
+
+            def usage_delta(stop_reason: StopReason | None) -> MessageDeltaEvent:
+                return MessageDeltaEvent(
+                    type="message_delta",
+                    delta=MessageDelta(stop_reason=stop_reason),
+                    usage=MessageDeltaUsage(
+                        output_tokens=state.output_tokens,
+                        input_tokens=state.input_tokens,
+                        cache_read_input_tokens=state.cache_read_input_tokens or None,
+                    ),
+                )
+
+            try:
+                async for chunk in result:
+                    for event in chat_completion_chunk_to_message_stream_events(chunk, state):
+                        yield event
+            except Exception:
+                # Flush the usage accumulated so far before re-raising, so a mid-stream failure still reports tokens.
+                # Report stop_reason=None so a finish_reason seen before the failure is never mistaken for a
+                # successful completion; message_stop stays reserved for the clean-completion path below.
+                if state.started:
+                    yield usage_delta(None)
+                raise
+            # Emit the closing events after the full stream is consumed so trailing-chunk usage is included.
+            if state.started:
                 if state.current_block_type is not None:
                     yield ContentBlockStopEvent(
                         type="content_block_stop",
                         index=state.current_block_index,
                     )
-                yield MessageDeltaEvent(
-                    type="message_delta",
-                    delta=MessageDelta(stop_reason="end_turn"),
-                    usage=MessageDeltaUsage(
-                        output_tokens=state.output_tokens,
-                        input_tokens=state.input_tokens,
-                    ),
-                )
+                yield usage_delta(state.stop_reason or "end_turn")
                 yield MessageStopEvent(type="message_stop")
 
         return convert_stream()
@@ -817,7 +827,7 @@ class AnyLLM(ABC):
     def responses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: type[ResponseFormatT],
         stream: Literal[False] | None = ...,
@@ -828,7 +838,7 @@ class AnyLLM(ABC):
     def responses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         stream: Literal[True],
         **kwargs: Any,
@@ -838,7 +848,7 @@ class AnyLLM(ABC):
     def responses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: dict[str, Any] | None = ...,
         stream: Literal[False] | None = ...,
@@ -849,7 +859,7 @@ class AnyLLM(ABC):
     def responses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: dict[str, Any] | type | None = ...,
         stream: bool | None = ...,
@@ -857,7 +867,7 @@ class AnyLLM(ABC):
     ) -> ResponseResource | Response | Iterator[ResponseStreamEvent] | ParsedResponse[Any]: ...
 
     def responses(
-        self, model: str, input_data: str | ResponseInputParam, **kwargs: Any
+        self, model: str, input_data: ResponseInput, **kwargs: Any
     ) -> ResponseResource | Response | Iterator[ResponseStreamEvent] | ParsedResponse[Any]:
         """Create a response synchronously.
 
@@ -886,7 +896,7 @@ class AnyLLM(ABC):
     async def aresponses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: type[ResponseFormatT],
         stream: Literal[False] | None = ...,
@@ -897,7 +907,7 @@ class AnyLLM(ABC):
     async def aresponses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         stream: Literal[True],
         **kwargs: Any,
@@ -907,7 +917,7 @@ class AnyLLM(ABC):
     async def aresponses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: dict[str, Any] | None = ...,
         stream: Literal[False] | None = ...,
@@ -918,7 +928,7 @@ class AnyLLM(ABC):
     async def aresponses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         response_format: dict[str, Any] | type | None = ...,
         stream: bool | None = ...,
@@ -929,7 +939,7 @@ class AnyLLM(ABC):
     async def aresponses(
         self,
         model: str,
-        input_data: str | ResponseInputParam,
+        input_data: ResponseInput,
         *,
         tools: list[dict[str, Any] | Callable[..., Any]] | Any | None = None,
         tool_choice: str | dict[str, Any] | None = None,
@@ -957,6 +967,7 @@ class AnyLLM(ABC):
         prompt_cache_key: str | None = None,
         prompt_cache_retention: str | None = None,
         conversation: str | dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> ResponseResource | Response | AsyncIterator[ResponseStreamEvent] | ParsedResponse[Any]:
         """Create a response using the OpenResponses API.
@@ -968,9 +979,9 @@ class AnyLLM(ABC):
 
         Args:
             model: Model identifier for the chosen provider (e.g., model='gpt-4.1-mini' for LLMProvider.OPENAI).
-            input_data: The input payload accepted by provider's Responses API.
-                For OpenAI-compatible providers, this is typically a list mixing
-                text, images, and tool instructions, or a dict per OpenAI spec.
+            input_data: Input text or a list of wire-format Responses items.
+                Items are passed through unchanged so prior response output and
+                reasoning items can be replayed in a stateless conversation.
             tools: Optional tools for tool calling (Python callables or OpenAI tool dicts)
             tool_choice: Controls which tools the model can call
             max_output_tokens: Maximum number of output tokens to generate
@@ -1000,6 +1011,7 @@ class AnyLLM(ABC):
             prompt_cache_key: A key to use when reading from or writing to the prompt cache.
             prompt_cache_retention: How long to retain a prompt cache entry created by this request.
             conversation: The conversation to associate this response with (ID string or ConversationParam object).
+            extra_body: Additional fields to merge into an OpenAI-compatible Responses request body.
             **kwargs: Additional provider-specific arguments that will be passed to the provider's API call.
 
         Returns:
@@ -1023,7 +1035,7 @@ class AnyLLM(ABC):
 
         params = ResponsesParams(
             model=model,
-            input=input_data,
+            input=cast("ResponseInputPayload", input_data),
             tools=prepared_tools,
             tool_choice=tool_choice,
             max_output_tokens=max_output_tokens,
@@ -1053,7 +1065,10 @@ class AnyLLM(ABC):
             **kwargs,
         )
 
-        result = await self._aresponses(params)
+        provider_kwargs: dict[str, Any] = {}
+        if extra_body is not None:
+            provider_kwargs["extra_body"] = extra_body
+        result = await self._aresponses(params, **provider_kwargs)
 
         if is_structured_output_type(response_format):
             # OpenAI-SDK providers return a ParsedResponse directly (via responses.parse);

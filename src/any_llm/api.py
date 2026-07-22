@@ -19,7 +19,7 @@ from any_llm.types.messages import MessageResponse, MessageStreamEvent, ParsedMe
 from any_llm.types.model import Model
 from any_llm.types.moderation import ModerationResponse
 from any_llm.types.rerank import RerankResponse
-from any_llm.types.responses import ParsedResponse, Response, ResponseInputParam, ResponseStreamEvent
+from any_llm.types.responses import ParsedResponse, Response, ResponseInput, ResponseStreamEvent
 
 
 def completion(
@@ -242,7 +242,7 @@ async def acompletion(
 
 def responses(
     model: str,
-    input_data: str | ResponseInputParam,
+    input_data: ResponseInput,
     *,
     provider: str | LLMProvider | None = None,
     tools: list[dict[str, Any] | Callable[..., Any]] | None = None,
@@ -273,6 +273,7 @@ def responses(
     prompt_cache_key: str | None = None,
     prompt_cache_retention: str | None = None,
     conversation: str | dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
     client_args: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> ResponseResource | Response | ParsedResponse[Any] | Iterator[ResponseStreamEvent]:
@@ -290,9 +291,9 @@ def responses(
             Legacy format 'provider/model' is also supported but deprecated.
         provider: **Recommended**: Provider name to use for the request (e.g., 'openai', 'mistral').
             When provided, the model parameter should contain only the model name.
-        input_data: The input payload accepted by provider's Responses API.
-            For OpenAI-compatible providers, this is typically a list mixing
-            text, images, and tool instructions, or a dict per OpenAI spec.
+        input_data: Input text or a list of wire-format Responses items.
+            Items are passed through unchanged so prior response output and
+            reasoning items can be replayed in a stateless conversation.
         tools: Optional tools for tool calling (Python callables or OpenAI tool dicts)
         tool_choice: Controls which tools the model can call
         max_output_tokens: Maximum number of output tokens to generate
@@ -323,6 +324,7 @@ def responses(
         prompt_cache_key: A key to use when reading from or writing to the prompt cache.
         prompt_cache_retention: How long to retain a prompt cache entry created by this request.
         conversation: The conversation to associate this response with (ID string or ConversationParam object).
+        extra_body: Additional fields to merge into an OpenAI-compatible Responses request body.
         client_args: Additional provider-specific arguments that will be passed to the provider's client instantiation.
         **kwargs: Additional provider-specific arguments that will be passed to the provider's API call.
 
@@ -377,13 +379,14 @@ def responses(
         prompt_cache_key=prompt_cache_key,
         prompt_cache_retention=prompt_cache_retention,
         conversation=conversation,
+        extra_body=extra_body,
         **kwargs,
     )
 
 
 async def aresponses(
     model: str,
-    input_data: str | ResponseInputParam,
+    input_data: ResponseInput,
     *,
     provider: str | LLMProvider | None = None,
     tools: list[dict[str, Any] | Callable[..., Any]] | None = None,
@@ -414,6 +417,7 @@ async def aresponses(
     prompt_cache_key: str | None = None,
     prompt_cache_retention: str | None = None,
     conversation: str | dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
     client_args: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> ResponseResource | Response | ParsedResponse[Any] | AsyncIterator[ResponseStreamEvent]:
@@ -431,9 +435,9 @@ async def aresponses(
             Legacy format 'provider/model' is also supported but deprecated.
         provider: **Recommended**: Provider name to use for the request (e.g., 'openai', 'mistral').
             When provided, the model parameter should contain only the model name.
-        input_data: The input payload accepted by provider's Responses API.
-            For OpenAI-compatible providers, this is typically a list mixing
-            text, images, and tool instructions, or a dict per OpenAI spec.
+        input_data: Input text or a list of wire-format Responses items.
+            Items are passed through unchanged so prior response output and
+            reasoning items can be replayed in a stateless conversation.
         tools: Optional tools for tool calling (Python callables or OpenAI tool dicts)
         tool_choice: Controls which tools the model can call
         max_output_tokens: Maximum number of output tokens to generate
@@ -464,6 +468,7 @@ async def aresponses(
         prompt_cache_key: A key to use when reading from or writing to the prompt cache.
         prompt_cache_retention: How long to retain a prompt cache entry created by this request.
         conversation: The conversation to associate this response with (ID string or ConversationParam object).
+        extra_body: Additional fields to merge into an OpenAI-compatible Responses request body.
         client_args: Additional provider-specific arguments that will be passed to the provider's client instantiation.
         **kwargs: Additional provider-specific arguments that will be passed to the provider's API call.
 
@@ -518,6 +523,7 @@ async def aresponses(
         prompt_cache_key=prompt_cache_key,
         prompt_cache_retention=prompt_cache_retention,
         conversation=conversation,
+        extra_body=extra_body,
         **kwargs,
     )
 
