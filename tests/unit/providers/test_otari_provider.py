@@ -31,6 +31,7 @@ from any_llm.types.messages import (
     MessagesParams,
     MessageStartEvent,
     MessageStopEvent,
+    ParsedBetaMessage,
     ParsedMessage,
     TextBlock,
 )
@@ -39,6 +40,10 @@ from any_llm.types.messages import (
 def _build_provider(mocked_client: MagicMock) -> OtariProvider:
     with patch("any_llm.providers.otari.otari.AsyncOtariClient", return_value=mocked_client):
         return OtariProvider(api_base="https://otari.example.com")
+
+
+def test_otari_passes_prompt_cache_key_to_the_resolved_provider() -> None:
+    assert OtariProvider.PROMPT_CACHE_KEY_SUPPORT == "passthrough"
 
 
 def _mock_otari_client() -> MagicMock:
@@ -108,41 +113,85 @@ def test_parse_jsonl_to_requests_skips_blank_lines() -> None:
     assert requests == [{"custom_id": "r1", "body": {"model": "gpt-4"}}]
 
 
-@patch.dict(
-    "os.environ",
-    {
-        "OTARI_API_BASE": "https://otari.example.com",
-        "OTARI_API_KEY": "resolved-api-key",
-        "OTARI_PLATFORM_TOKEN": "platform-token",
-    },
-    clear=False,
-)
-def test_otari_auto_mode_prefers_explicit_api_key_over_platform_token() -> None:
-    with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
-        mock_otari_client.return_value = _mock_otari_client()
-        OtariProvider(api_key="explicit-key")
-
-    call_kwargs = mock_otari_client.call_args.kwargs
-    assert call_kwargs["api_key"] == "explicit-key"
-    assert "platform_token" not in call_kwargs
+# Every otari auth env var, blanked. Spread into a test's patch.dict and override only the
+# vars under test, so an ambient OTARI_AI_TOKEN (set in CI) can't leak into auth resolution.
+_OTARI_ENV_CLEARED = {
+    "OTARI_API_KEY": "",
+    "OTARI_AI_TOKEN": "",
+    "OTARI_PLATFORM_TOKEN": "",
+    "GATEWAY_PLATFORM_TOKEN": "",
+    "GATEWAY_API_KEY": "",
+    "OTARI_API_BASE": "",
+    "GATEWAY_API_BASE": "",
+}
 
 
-@patch.dict(
-    "os.environ",
-    {
-        "OTARI_API_BASE": "https://otari.example.com",
-        "OTARI_API_KEY": "resolved-api-key",
-        "OTARI_PLATFORM_TOKEN": "",
-    },
-    clear=False,
-)
-def test_otari_auto_mode_uses_resolved_api_key_when_no_platform_token() -> None:
+@patch.dict("os.environ", {**_OTARI_ENV_CLEARED, "OTARI_API_KEY": "tk_platform"}, clear=False)
+def test_otari_api_key_env_maps_to_platform_token_without_base() -> None:
+    """OTARI_API_KEY is otari.ai's documented platform token (Authorization: Bearer), so it
+    routes to platform mode and needs no api_base (otari defaults to its hosted gateway).
+    This is the otari.ai quickstart path."""
     with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
         mock_otari_client.return_value = _mock_otari_client()
         OtariProvider()
 
     call_kwargs = mock_otari_client.call_args.kwargs
-    assert call_kwargs["api_key"] == "resolved-api-key"
+    assert call_kwargs["platform_token"] == "tk_platform"  # noqa: S105
+    assert "api_key" not in call_kwargs
+    assert "api_base" not in call_kwargs
+
+
+@patch.dict("os.environ", {**_OTARI_ENV_CLEARED, "OTARI_PLATFORM_TOKEN": "env-platform"}, clear=False)
+def test_otari_explicit_api_key_param_maps_to_platform_token() -> None:
+    """An explicit api_key= param is the platform token too, and takes precedence over an
+    env platform-token alias."""
+    with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
+        mock_otari_client.return_value = _mock_otari_client()
+        OtariProvider(api_key="tk_explicit")
+
+    call_kwargs = mock_otari_client.call_args.kwargs
+    assert call_kwargs["platform_token"] == "tk_explicit"  # noqa: S105
+    assert "api_key" not in call_kwargs
+
+
+@patch.dict(
+    "os.environ",
+    {**_OTARI_ENV_CLEARED, "GATEWAY_API_KEY": "gw-self", "GATEWAY_API_BASE": "https://self.example.com"},
+    clear=False,
+)
+def test_otari_gateway_api_key_env_maps_to_self_hosted_api_key() -> None:
+    """GATEWAY_API_KEY is the self-hosted virtual key (Otari-Key header), distinct from the
+    platform token; it routes to the api_key slot alongside its required base."""
+    with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
+        mock_otari_client.return_value = _mock_otari_client()
+        OtariProvider()
+
+    call_kwargs = mock_otari_client.call_args.kwargs
+    assert call_kwargs["api_key"] == "gw-self"
+    assert "platform_token" not in call_kwargs
+    assert call_kwargs["api_base"] == "https://self.example.com"
+
+
+@patch.dict("os.environ", {**_OTARI_ENV_CLEARED, "OTARI_API_KEY": "tk_platform"}, clear=False)
+def test_otari_platform_mode_false_routes_key_to_self_hosted_slot() -> None:
+    """platform_mode=False forces the self-hosted path: the explicit key goes to the
+    Otari-Key api_key slot, not the platform token."""
+    with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
+        mock_otari_client.return_value = _mock_otari_client()
+        OtariProvider(api_key="gw-key", api_base="https://self.example.com", platform_mode=False)
+
+    call_kwargs = mock_otari_client.call_args.kwargs
+    assert call_kwargs["api_key"] == "gw-key"
+    assert "platform_token" not in call_kwargs
+
+
+@patch.dict("os.environ", {**_OTARI_ENV_CLEARED, "GATEWAY_API_KEY": "gw-self"}, clear=False)
+def test_otari_self_hosted_key_without_base_raises() -> None:
+    """A self-hosted gateway key with no base and no platform token still requires api_base."""
+    with patch("any_llm.providers.otari.otari.AsyncOtariClient") as mock_otari_client:
+        mock_otari_client.return_value = _mock_otari_client()
+        with pytest.raises(ValueError, match="api_base is required"):
+            OtariProvider()
 
 
 @pytest.mark.asyncio
@@ -558,12 +607,14 @@ async def test_otari_completion_sends_max_tokens_not_max_completion_tokens() -> 
         model_id="gpt-4",
         messages=[{"role": "user", "content": "Hello"}],
         max_tokens=42,
+        prompt_cache_key="tenant-1",
     )
 
     await provider._acompletion(params)
 
     call_kwargs = mocked_client.completion.call_args.kwargs
     assert call_kwargs["max_tokens"] == 42
+    assert call_kwargs["prompt_cache_key"] == "tenant-1"
     assert "max_completion_tokens" not in call_kwargs
 
 
@@ -736,6 +787,7 @@ async def test_otari_amessages_delegates_to_native_endpoint_preserving_anthropic
         max_tokens=100,
         system=[{"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}],
         thinking={"type": "enabled", "budget_tokens": 1024},
+        prompt_cache_key="tenant-1",
     )
 
     result = await provider._amessages(params, metadata={"user_id": "u1"})
@@ -752,9 +804,34 @@ async def test_otari_amessages_delegates_to_native_endpoint_preserving_anthropic
     # cache_control on the system block and thinking config survive the pass-through.
     assert call_kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert call_kwargs["prompt_cache_key"] == "tenant-1"
     # Extra kwargs are forwarded; stream is not set for non-streaming calls.
     assert call_kwargs["metadata"] == {"user_id": "u1"}
     assert "stream" not in call_kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_params",
+    [
+        {"context_management": {"edits": [{"type": "compact_20260112"}]}},
+        {"betas": ["compact-2026-01-12"]},
+    ],
+)
+async def test_otari_amessages_rejects_anthropic_beta_params(unsupported_params: dict[str, Any]) -> None:
+    client = _mock_otari_client()
+    provider = _build_provider(client)
+    params = MessagesParams(
+        model="claude-sonnet-4-5",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=100,
+        **unsupported_params,
+    )
+
+    with pytest.raises(NotImplementedError, match="native Anthropic Messages"):
+        await provider._amessages(params)
+
+    client.message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -849,7 +926,7 @@ async def test_otari_amessages_streaming_yields_typed_events_and_skips_unknown()
 
     result = await provider._amessages(params)
 
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
     collected = [event async for event in result]
 
     # The unknown "ping" event is skipped; everything else is yielded in order.

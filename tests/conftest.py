@@ -45,7 +45,10 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.GROQ: "openai/gpt-oss-20b",
         LLMProvider.FIREWORKS: "accounts/fireworks/models/gpt-oss-20b",
         LLMProvider.OPENAI: "gpt-5-nano",
-        LLMProvider.MISTRAL: "magistral-medium-latest",
+        # magistral-medium-latest / magistral-small-latest (native reasoning models) are
+        # deprecated; mistral-medium-3-5 supports adjustable reasoning via reasoning_effort
+        # (high/none only, see MistralProvider._convert_completion_params).
+        LLMProvider.MISTRAL: "mistral-medium-3-5",
         LLMProvider.GMI: "zai-org/GLM-5-FP8",
         LLMProvider.XAI: "grok-3-mini-latest",
         LLMProvider.OLLAMA: "qwen3:0.6b",
@@ -55,6 +58,7 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.VLLM: "N/A",
         LLMProvider.CASCADIA: "N/A",
         LLMProvider.ATLASCLOUD: "deepseek-ai/deepseek-v4-flash",
+        LLMProvider.KENARI: "deepseek-v4-flash",
         LLMProvider.LMSTUDIO: "qwen3-0.6b",
         LLMProvider.AZUREOPENAI: "gpt-4.1-nano",
         LLMProvider.CEREBRAS: "gpt-oss-120b",
@@ -110,6 +114,7 @@ def provider_model_map() -> dict[LLMProvider, str]:
         LLMProvider.VLLM: "Qwen/Qwen2.5-0.5B-Instruct",
         LLMProvider.CASCADIA: "Qwen/Qwen2.5-0.5B-Instruct",
         LLMProvider.ATLASCLOUD: "deepseek-v3",
+        LLMProvider.KENARI: "deepseek-v4-flash",
         LLMProvider.COHERE: "command-a-03-2025",
         LLMProvider.CEREBRAS: "gpt-oss-120b",
         LLMProvider.HUGGINGFACE: "Qwen/Qwen2.5-72B-Instruct",

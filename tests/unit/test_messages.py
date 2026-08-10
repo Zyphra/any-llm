@@ -1,13 +1,28 @@
 """Tests for messages()/amessages() SDK API."""
 
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import Any
+from inspect import signature
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from anthropic.types.beta import (
+    BetaCompactionIterationUsage,
+    BetaContainer,
+    BetaIterationsUsage,
+    BetaMessage,
+    BetaMessageDeltaUsage,
+    BetaSkill,
+    BetaStopReason,
+    BetaUsage,
+)
+from anthropic.types.beta.beta_context_management_response import BetaContextManagementResponse
+from anthropic.types.beta.parsed_beta_message import ParsedBetaTextBlock
+from pydantic import BaseModel
 
 from any_llm.any_llm import AnyLLM
-from any_llm.api import amessages
+from any_llm.api import amessages, messages
+from any_llm.exceptions import UnsupportedParameterError
 from any_llm.types.completion import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -18,7 +33,59 @@ from any_llm.types.completion import (
     CompletionUsage,
     PromptTokensDetails,
 )
-from any_llm.types.messages import MessageDeltaEvent, MessageResponse, MessagesParams, ParsedMessage, ParsedTextBlock
+from any_llm.types.messages import (
+    BetaDiagnostics,
+    ContentBlock,
+    MessageContentBlock,
+    MessageDeltaEvent,
+    MessageDeltaUsage,
+    MessageResponse,
+    MessagesParams,
+    MessageUsage,
+    ParsedBetaMessage,
+    ParsedMessage,
+    ParsedTextBlock,
+    StopReason,
+)
+
+
+def test_stop_reason_aliases_anthropic_beta_type() -> None:
+    assert StopReason is BetaStopReason
+
+
+def test_content_block_alias_matches_message_content_block() -> None:
+    assert ContentBlock is MessageContentBlock
+
+
+def test_messages_params_exposes_prompt_cache_key_in_schema() -> None:
+    params = MessagesParams(
+        model="gpt-5.6",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=100,
+        prompt_cache_key="tenant-1",
+    )
+
+    assert params.prompt_cache_key == "tenant-1"
+    assert "prompt_cache_key" in MessagesParams.model_json_schema()["properties"]
+
+
+@pytest.mark.asyncio
+async def test_amessages_rejects_prompt_cache_key_for_unsupported_provider() -> None:
+    pytest.importorskip("boto3")
+    from any_llm.providers.bedrock.bedrock import BedrockProvider
+
+    client = Mock()
+    provider = BedrockProvider(client=client)
+
+    with pytest.raises(UnsupportedParameterError, match="prompt_cache_key"):
+        await provider.amessages(
+            model="anthropic.claude-sonnet",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=100,
+            prompt_cache_key="tenant-1",
+        )
+
+    client.converse.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -111,6 +178,22 @@ def test_messages_params_with_all_fields() -> None:
     assert len(params.tools) == 1
 
 
+def test_messages_params_accepts_context_management_and_betas() -> None:
+    context_management = {"edits": [{"type": "compact_20260112"}]}
+    betas = ["compact-2026-01-12"]
+
+    params = MessagesParams(
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=1024,
+        context_management=context_management,
+        betas=betas,
+    )
+
+    assert params.context_management == context_management
+    assert params.betas == betas
+
+
 def test_messages_params_rejects_extra_fields() -> None:
     """Test MessagesParams rejects unknown fields (extra='forbid')."""
     from pydantic import ValidationError
@@ -144,6 +227,178 @@ def test_message_response_model() -> None:
     assert isinstance(block, TextBlock)
     assert block.text == "Hello!"
     assert resp.usage.input_tokens == 10
+    assert resp.usage.iterations is None
+    assert resp.diagnostics is None
+
+
+def test_message_usage_preserves_typed_beta_iterations() -> None:
+    sdk_usage = BetaUsage.model_validate(
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "iterations": [
+                {
+                    "type": "compaction",
+                    "input_tokens": 90,
+                    "output_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            ],
+        }
+    )
+
+    usage = MessageUsage.model_validate(sdk_usage, from_attributes=True)
+
+    assert MessageUsage.model_fields["iterations"].annotation == BetaIterationsUsage | None
+    assert usage.iterations is not None
+    assert isinstance(usage.iterations[0], BetaCompactionIterationUsage)
+    assert usage.model_dump()["iterations"][0]["type"] == "compaction"
+
+
+def test_message_delta_usage_preserves_typed_beta_iterations() -> None:
+    sdk_usage = BetaMessageDeltaUsage.model_validate(
+        {
+            "output_tokens": 20,
+            "iterations": [
+                {
+                    "type": "compaction",
+                    "input_tokens": 90,
+                    "output_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            ],
+        }
+    )
+
+    usage = MessageDeltaUsage.model_validate(sdk_usage, from_attributes=True)
+
+    assert MessageDeltaUsage.model_fields["iterations"].annotation == BetaIterationsUsage | None
+    assert usage.iterations is not None
+    assert isinstance(usage.iterations[0], BetaCompactionIterationUsage)
+    assert usage.model_dump()["iterations"][0]["type"] == "compaction"
+
+
+def test_message_response_preserves_beta_usage_speed_and_container_skills() -> None:
+    beta_message = BetaMessage.model_validate(
+        {
+            "id": "msg_beta",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "content": [],
+            "container": {
+                "id": "container_1",
+                "expires_at": "2026-08-05T00:00:00Z",
+                "skills": [{"skill_id": "pdf", "type": "anthropic", "version": "latest"}],
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 1, "speed": "fast"},
+        }
+    )
+
+    response = MessageResponse.model_validate(beta_message, from_attributes=True)
+
+    assert response.usage.speed == "fast"
+    assert isinstance(response.container, BetaContainer)
+    assert response.container.skills is not None
+    assert isinstance(response.container.skills[0], BetaSkill)
+    assert response.container.skills[0].skill_id == "pdf"
+
+
+def test_message_response_preserves_typed_beta_telemetry() -> None:
+    try:
+        from anthropic.types.beta import BetaCacheMissToolsChanged
+        from anthropic.types.beta.beta_diagnostics import BetaDiagnostics as AnthropicBetaDiagnostics
+    except ImportError:
+        pytest.skip("BetaDiagnostics requires anthropic 0.102.0 or newer")
+
+    beta_message = BetaMessage.model_validate(
+        {
+            "id": "msg_beta",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "content": [{"type": "text", "text": "Done"}],
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+            "context_management": {
+                "applied_edits": [
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "cleared_input_tokens": 42,
+                        "cleared_tool_uses": 2,
+                    }
+                ]
+            },
+            "diagnostics": {
+                "cache_miss_reason": {
+                    "type": "tools_changed",
+                    "cache_missed_input_tokens": 7,
+                }
+            },
+        }
+    )
+
+    response = MessageResponse.model_validate(beta_message, from_attributes=True)
+
+    assert isinstance(response.context_management, BetaContextManagementResponse)
+    applied_edit = response.context_management.applied_edits[0]
+    assert applied_edit.cleared_input_tokens == 42
+    assert BetaDiagnostics is AnthropicBetaDiagnostics
+    assert isinstance(response.diagnostics, AnthropicBetaDiagnostics)
+    assert isinstance(response.diagnostics.cache_miss_reason, BetaCacheMissToolsChanged)
+    assert response.diagnostics.cache_miss_reason.type == "tools_changed"
+    assert response.diagnostics.cache_miss_reason.cache_missed_input_tokens == 7
+    dumped = response.model_dump()
+    assert dumped["context_management"]["applied_edits"][0]["cleared_input_tokens"] == 42
+    assert dumped["diagnostics"]["cache_miss_reason"]["cache_missed_input_tokens"] == 7
+
+
+def test_message_diagnostics_fallback_supports_the_anthropic_sdk_floor() -> None:
+    try:
+        from anthropic.types.beta.beta_diagnostics import BetaDiagnostics as AnthropicBetaDiagnostics
+    except ImportError:
+        diagnostics = BetaDiagnostics.model_validate(
+            {
+                "cache_miss_reason": {
+                    "type": "tools_changed",
+                    "cache_missed_input_tokens": 7,
+                    "future_field": "preserved",
+                }
+            }
+        )
+
+        reason = cast("dict[str, Any]", diagnostics.cache_miss_reason)
+        assert reason["cache_missed_input_tokens"] == 7
+        assert diagnostics.model_dump()["cache_miss_reason"]["future_field"] == "preserved"
+    else:
+        pytest.skip(f"SDK provides {AnthropicBetaDiagnostics.__name__}")
+
+
+def test_message_delta_event_preserves_typed_context_management() -> None:
+    event = MessageDeltaEvent.model_validate(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": None, "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+            "context_management": {
+                "applied_edits": [
+                    {
+                        "type": "clear_thinking_20251015",
+                        "cleared_input_tokens": 21,
+                        "cleared_thinking_turns": 1,
+                    }
+                ]
+            },
+        }
+    )
+
+    assert isinstance(event.context_management, BetaContextManagementResponse)
+    assert event.context_management.applied_edits[0].cleared_input_tokens == 21
 
 
 def test_message_stream_event_types() -> None:
@@ -244,6 +499,7 @@ async def test_amessages_parameter_capture() -> None:
             tool_choice={"type": "auto"},
             metadata={"user_id": "u1"},
             thinking={"type": "enabled", "budget_tokens": 4096},
+            prompt_cache_key="tenant-1",
             api_key="sk-test",
             api_base="https://custom.example.com",
         )
@@ -270,6 +526,103 @@ async def test_amessages_parameter_capture() -> None:
         assert call_args.kwargs["tool_choice"] == {"type": "auto"}
         assert call_args.kwargs["metadata"] == {"user_id": "u1"}
         assert call_args.kwargs["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+        assert call_args.kwargs["prompt_cache_key"] == "tenant-1"
+
+
+@pytest.mark.asyncio
+async def test_amessages_forwards_typed_messages_params() -> None:
+    assert "prompt_cache_key" in signature(amessages).parameters
+    assert "context_management" in signature(amessages).parameters
+    assert "betas" in signature(amessages).parameters
+    assert "prompt_cache_key" in signature(AnyLLM.amessages).parameters
+    assert "context_management" in signature(AnyLLM.amessages).parameters
+    assert "betas" in signature(AnyLLM.amessages).parameters
+
+    mock_provider = Mock()
+    mock_provider.amessages = AsyncMock(return_value=Mock())
+    context_management = {"edits": [{"type": "compact_20260112"}]}
+    betas = ["compact-2026-01-12"]
+
+    with patch("any_llm.any_llm.AnyLLM.create", return_value=mock_provider):
+        await amessages(
+            model="claude-opus-5",
+            provider="anthropic",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=1024,
+            prompt_cache_key="tenant-1",
+            context_management=context_management,
+            betas=betas,
+        )
+
+    call_kwargs = mock_provider.amessages.await_args.kwargs
+    assert call_kwargs["prompt_cache_key"] == "tenant-1"
+    assert call_kwargs["context_management"] == context_management
+    assert call_kwargs["betas"] == betas
+
+
+def test_messages_returns_parsed_beta_message_without_treating_it_as_a_stream() -> None:
+    class Answer(BaseModel):
+        value: str
+
+    parsed_message = ParsedBetaMessage[Answer](
+        id="msg_beta_parse",
+        type="message",
+        role="assistant",
+        model="claude-opus-5",
+        stop_reason="end_turn",
+        content=[
+            ParsedBetaTextBlock[Answer](
+                type="text",
+                text='{"value":"ok"}',
+                parsed_output=Answer(value="ok"),
+            )
+        ],
+        usage=BetaUsage(input_tokens=1, output_tokens=1),
+    )
+    mock_provider = Mock(spec=AnyLLM)
+    mock_provider.amessages = AsyncMock(return_value=parsed_message)
+
+    result = AnyLLM.messages(
+        mock_provider,
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=100,
+        context_management={"edits": [{"type": "compact_20260112"}]},
+        output_format=Answer,
+    )
+
+    assert result is parsed_message
+    assert parsed_message.parsed_output == Answer(value="ok")
+
+
+def test_messages_forwards_typed_messages_params() -> None:
+    assert "prompt_cache_key" in signature(messages).parameters
+    assert "context_management" in signature(messages).parameters
+    assert "betas" in signature(messages).parameters
+    assert "prompt_cache_key" in signature(AnyLLM.messages).parameters
+    assert "context_management" in signature(AnyLLM.messages).parameters
+    assert "betas" in signature(AnyLLM.messages).parameters
+
+    mock_provider = Mock()
+    mock_provider.messages = Mock(return_value=Mock())
+    context_management = {"edits": [{"type": "compact_20260112"}]}
+    betas = ["compact-2026-01-12"]
+
+    with patch("any_llm.any_llm.AnyLLM.create", return_value=mock_provider):
+        messages(
+            model="claude-opus-5",
+            provider="anthropic",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=1024,
+            prompt_cache_key="tenant-1",
+            context_management=context_management,
+            betas=betas,
+        )
+
+    call_kwargs = mock_provider.messages.call_args.kwargs
+    assert call_kwargs["prompt_cache_key"] == "tenant-1"
+    assert call_kwargs["context_management"] == context_management
+    assert call_kwargs["betas"] == betas
 
 
 @pytest.mark.asyncio
@@ -345,6 +698,7 @@ async def test_default_amessages_non_streaming() -> None:
         model="gpt-4",
         messages=[{"role": "user", "content": "Hello"}],
         max_tokens=100,
+        prompt_cache_key="tenant-1",
     )
     result = await AnyLLM._amessages(mock_provider, params)
     assert isinstance(result, MessageResponse)
@@ -353,6 +707,29 @@ async def test_default_amessages_non_streaming() -> None:
     assert result.content[0].text == "Hi!"
     assert result.stop_reason == "end_turn"
     assert result.usage.input_tokens == 10
+    completion_params = mock_provider._acompletion.await_args.args[0]
+    assert completion_params.prompt_cache_key == "tenant-1"
+    assert "prompt_cache_key" not in mock_provider._acompletion.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_params",
+    [
+        {"context_management": {"edits": [{"type": "compact_20260112"}]}},
+        {"betas": ["compact-2026-01-12"]},
+    ],
+)
+async def test_default_amessages_rejects_anthropic_beta_params(unsupported_params: dict[str, Any]) -> None:
+    params = MessagesParams(
+        model="gpt-4",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=100,
+        **unsupported_params,
+    )
+
+    with pytest.raises(NotImplementedError, match="native Anthropic Messages"):
+        await AnyLLM._amessages(Mock(), params)
 
 
 @pytest.mark.asyncio
@@ -393,7 +770,7 @@ async def test_default_amessages_streaming() -> None:
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     events = []
     async for event in result:
@@ -433,7 +810,7 @@ async def test_default_amessages_streaming_requests_include_usage() -> None:
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
     async for _ in result:  # drive the generator so _acompletion is invoked
         pass
 
@@ -516,13 +893,17 @@ async def test_default_amessages_streaming_usage_from_trailing_chunk() -> None:
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     events = [event async for event in result]
     delta = next(e for e in events if isinstance(e, MessageDeltaEvent))
-    assert delta.usage.input_tokens == 100
+    # Anthropic's input_tokens and cache_read_input_tokens are disjoint, so the cached
+    # count is subtracted out of the 100-token OpenAI prompt total rather than copied
+    # alongside it.
+    assert delta.usage.input_tokens == 20
     assert delta.usage.output_tokens == 50
     assert delta.usage.cache_read_input_tokens == 80
+    assert delta.usage.input_tokens + delta.usage.cache_read_input_tokens == 100
     assert delta.delta.stop_reason == "end_turn"
     assert events[-1].type == "message_stop"
 
@@ -553,7 +934,7 @@ async def test_default_amessages_streaming_flushes_usage_when_stream_fails() -> 
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     seen: list[Any] = []
 
@@ -605,7 +986,7 @@ async def test_default_amessages_streaming_failure_after_finish_reason_reports_n
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     seen: list[Any] = []
 
@@ -646,7 +1027,7 @@ async def test_default_amessages_streaming_failure_before_first_chunk_emits_noth
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     seen: list[Any] = []
 
@@ -757,7 +1138,7 @@ async def test_default_amessages_streaming_no_finish_reason_closes_open_block() 
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     events = [event async for event in result]
     assert [e.type for e in events] == [
@@ -790,7 +1171,7 @@ async def test_default_amessages_streaming_empty_stream_emits_nothing() -> None:
         stream=True,
     )
     result = await AnyLLM._amessages(mock_provider, params)
-    assert not isinstance(result, (MessageResponse, ParsedMessage))
+    assert not isinstance(result, (MessageResponse, ParsedMessage, ParsedBetaMessage))
 
     events = [event async for event in result]
     assert events == []

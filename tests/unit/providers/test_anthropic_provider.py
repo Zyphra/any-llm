@@ -1,12 +1,14 @@
 import dataclasses
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any, cast, get_args
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anthropic import transform_schema
+from anthropic.types import Message
+from anthropic.types.model_info import ModelInfo
 from pydantic import BaseModel
 
 from any_llm.exceptions import UnsupportedParameterError
@@ -14,6 +16,7 @@ from any_llm.providers.anthropic.anthropic import AnthropicProvider
 from any_llm.providers.anthropic.utils import (
     DEFAULT_MAX_TOKENS,
     REASONING_EFFORT_TO_ANTHROPIC_EFFORT,
+    _convert_models_list,
     _convert_response_format,
     _convert_tool_spec,
 )
@@ -1284,3 +1287,105 @@ def test_convert_tool_spec_parameters_missing_properties() -> None:
     tools = _convert_tool_spec([{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}])
     assert len(tools) == 1
     assert tools[0]["input_schema"]["properties"] == {}
+
+
+def test_convert_models_list_uses_created_at() -> None:
+    """The normal path: a real Anthropic listing carries created_at."""
+    created_at = datetime(2026, 2, 19, tzinfo=UTC)
+    model = ModelInfo.construct(id="claude-opus-4-5", type="model", display_name="Opus", created_at=created_at)
+
+    result = _convert_models_list([model])
+
+    assert len(result) == 1
+    assert result[0].id == "claude-opus-4-5"
+    assert result[0].created == int(created_at.timestamp())
+    assert result[0].owned_by == "anthropic"
+
+
+def test_convert_models_list_missing_created_at() -> None:
+    """Regression: created_at=None must not raise "'NoneType' object has no attribute 'timestamp'".
+
+    ModelInfo requires created_at, but an Anthropic-compatible gateway may serve
+    /v1/models in the OpenAI shape, which has an integer "created" and no
+    "created_at". The SDK constructs the model without validating, so the
+    attribute exists and is None, and the whole listing used to fail.
+    """
+    model = ModelInfo.construct(id="gateway-alias:some-model", type="model", display_name="Alias", created_at=None)
+
+    result = _convert_models_list([model])
+
+    assert len(result) == 1
+    assert result[0].id == "gateway-alias:some-model"
+    assert result[0].created == 0
+    assert result[0].owned_by == "anthropic"
+
+
+def test_convert_models_list_mixed_created_at() -> None:
+    """One entry missing created_at must not discard the entries that have it."""
+    created_at = datetime(2026, 2, 19, tzinfo=UTC)
+    models = [
+        ModelInfo.construct(id="with", type="model", display_name="With", created_at=created_at),
+        ModelInfo.construct(id="without", type="model", display_name="Without", created_at=None),
+    ]
+
+    result = _convert_models_list(models)
+
+    assert [m.id for m in result] == ["with", "without"]
+    assert [m.created for m in result] == [int(created_at.timestamp()), 0]
+
+
+def _anthropic_message(**extra: Any) -> Message:
+    """Build a spec-shaped Messages response, plus any extra fields an endpoint might send."""
+    return Message.model_validate(
+        {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-haiku",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            **extra,
+        }
+    )
+
+
+def test_convert_response_without_created_at() -> None:
+    """The Anthropic Messages API carries no timestamp, so created falls back to 0."""
+    from any_llm.providers.anthropic.utils import _convert_response
+
+    result = _convert_response(_anthropic_message())
+
+    assert result.created == 0
+    assert result.choices[0].message.content == "hello"
+
+
+def test_convert_response_with_created_at() -> None:
+    """When an endpoint does supply a datetime, it is used."""
+    from any_llm.providers.anthropic.utils import _convert_response
+
+    created_at = datetime(2026, 2, 19, tzinfo=UTC)
+
+    result = _convert_response(_anthropic_message(created_at=created_at))
+
+    assert result.created == int(created_at.timestamp())
+
+
+@pytest.mark.parametrize("created_at", [None, 1750000000, "2026-01-01T00:00:00Z"])
+def test_convert_response_non_datetime_created_at(created_at: Any) -> None:
+    """Regression: a non-datetime created_at must not raise "'NoneType' object has no attribute 'timestamp'".
+
+    Message does not declare created_at, so an Anthropic-compatible endpoint that sends the
+    field anyway has it kept as an unvalidated extra attribute holding the raw JSON value.
+    A bare hasattr guard passed for these and crashed the whole completion on .timestamp().
+    """
+    from any_llm.providers.anthropic.utils import _convert_response
+
+    response = _anthropic_message(created_at=created_at)
+    assert hasattr(response, "created_at")
+
+    result = _convert_response(response)
+
+    assert result.created == 0
+    assert result.choices[0].message.content == "hello"
