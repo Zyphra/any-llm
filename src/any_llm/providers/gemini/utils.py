@@ -204,8 +204,11 @@ def _convert_messages(
                         logger.debug("Skipping unsupported Gemini content block type: %s", content.get("type"))
             formatted_messages.append(types.Content(role="user", parts=parts))
         elif message["role"] == "assistant":
+            parts = []
+            if isinstance(content := message.get("content"), str) and content:
+                parts.append(types.Part.from_text(text=content))
+
             if message.get("tool_calls"):
-                parts = []
                 for i, tool_call in enumerate(message["tool_calls"]):
                     function_call = tool_call["function"]
                     args = json.loads(function_call["arguments"]) if function_call["arguments"] else {}
@@ -229,9 +232,6 @@ def _convert_messages(
                             thought_signature=thought_signature,
                         )
                     )
-            else:
-                parts = [types.Part.from_text(text=message["content"])]
-
             formatted_messages.append(types.Content(role="model", parts=parts))
         elif message["role"] == "tool":
             try:
@@ -379,7 +379,7 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
                 {
                     "message": {
                         "role": "assistant",
-                        "content": None if tool_calls_list else text_content,
+                        "content": text_content,
                         "reasoning": reasoning,
                         "tool_calls": tool_calls_list or None,
                     },

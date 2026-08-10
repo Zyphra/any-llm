@@ -1088,7 +1088,13 @@ def test_convert_messages_replays_thinking_block_with_tool_call() -> None:
         {"role": "user", "content": "What's the weather in Paris?"},
         {
             "role": "assistant",
-            "content": None,
+            "content": [
+                {
+                    "type": "text",
+                    "text": "I will check the weather.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "reasoning": "Let me check the weather tool.",
             "extra_content": {"anthropic": {"signature": "sig-12345"}},
             "tool_calls": [
@@ -1112,6 +1118,11 @@ def test_convert_messages_replays_thinking_block_with_tool_call() -> None:
         "signature": "sig-12345",
     }
     assert assistant_message["content"][1] == {
+        "type": "text",
+        "text": "I will check the weather.",
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert assistant_message["content"][2] == {
         "type": "tool_use",
         "id": "toolu_1",
         "name": "get_weather",

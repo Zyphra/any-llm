@@ -542,15 +542,19 @@ def test_convert_response_single_tool_call() -> None:
     mock_response = Mock()
     mock_response.candidates = [Mock()]
     mock_response.candidates[0].content = Mock()
-    mock_response.candidates[0].content.parts = [Mock()]
+    mock_response.candidates[0].content.parts = [Mock(), Mock()]
+
+    mock_response.candidates[0].content.parts[0].function_call = None
+    mock_response.candidates[0].content.parts[0].thought = None
+    mock_response.candidates[0].content.parts[0].text = "I will search now."
 
     mock_function_call = Mock()
     mock_function_call.name = "search_web"
     mock_function_call.args = {"query": "test query", "limit": 5}
 
-    mock_response.candidates[0].content.parts[0].function_call = mock_function_call
-    mock_response.candidates[0].content.parts[0].thought = None
-    mock_response.candidates[0].content.parts[0].text = None
+    mock_response.candidates[0].content.parts[1].function_call = mock_function_call
+    mock_response.candidates[0].content.parts[1].thought = None
+    mock_response.candidates[0].content.parts[1].text = None
 
     mock_response.usage_metadata = Mock()
     mock_response.usage_metadata.prompt_token_count = 10
@@ -564,7 +568,7 @@ def test_convert_response_single_tool_call() -> None:
     choice = response_dict["choices"][0]
 
     assert choice["message"]["role"] == "assistant"
-    assert choice["message"]["content"] is None
+    assert choice["message"]["content"] == "I will search now."
     assert choice["finish_reason"] == "tool_calls"
     assert choice["index"] == 0
 
@@ -1330,7 +1334,7 @@ def test_convert_messages_with_thought_signature_in_extra_content() -> None:
         {"role": "user", "content": "What is the weather?"},
         {
             "role": "assistant",
-            "content": None,
+            "content": "I will check the weather.",
             "tool_calls": [
                 {
                     "id": "call_123",
@@ -1350,8 +1354,9 @@ def test_convert_messages_with_thought_signature_in_extra_content() -> None:
     assistant_message = formatted_messages[1]
     assert assistant_message.role == "model"
     assert assistant_message.parts is not None
-    assert len(assistant_message.parts) == 1
-    assert assistant_message.parts[0].thought_signature == original_bytes
+    assert len(assistant_message.parts) == 2
+    assert assistant_message.parts[0].text == "I will check the weather."
+    assert assistant_message.parts[1].thought_signature == original_bytes
 
 
 def test_convert_messages_with_base64_image() -> None:

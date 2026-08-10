@@ -103,7 +103,7 @@ def _convert_content_for_anthropic(content: list[dict[str, Any]]) -> list[dict[s
     - Convert image_url blocks to Anthropic image format
     - Convert file blocks (PDFs) to Anthropic document format
     """
-    converted_content = []
+    converted_content: list[dict[str, Any]] = []
     for block in content:
         if block.get("type") == "image_url":
             converted_block: dict[str, Any] = {"type": "image"}
@@ -158,13 +158,19 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
             else:
                 system_message += "\n" + message["content"]
         else:
+            content = message.get("content")
+            content_blocks: list[dict[str, Any]] = []
+            if isinstance(content, str) and content:
+                content_blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                content_blocks.extend(cast("list[dict[str, Any]]", content))
+
             # Handle messages inside agent loop.
             # See https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview#tool-use-examples
             if _is_tool_call(message):
                 # Convert ALL tool calls from the assistant message
-                content_blocks: list[dict[str, Any]] = []
                 if thinking_block := _build_anthropic_thinking_block(message):
-                    content_blocks.append(thinking_block)
+                    content_blocks.insert(0, thinking_block)
                 for tool_call in message["tool_calls"]:
                     content_blocks.append(
                         {
@@ -200,15 +206,7 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
                     "content": [tool_result],
                 }
             elif message["role"] == "assistant" and (thinking_block := _build_anthropic_thinking_block(message)):
-                # existing_content may be None (a reasoning-only turn with no text/tool_calls),
-                # a plain string, or a list of content blocks.
-                existing_content = message.get("content")
-                content_blocks = [thinking_block]
-                if isinstance(existing_content, str):
-                    if existing_content:
-                        content_blocks.append({"type": "text", "text": existing_content})
-                elif isinstance(existing_content, list):
-                    content_blocks.extend(existing_content)
+                content_blocks.insert(0, thinking_block)
                 message = {
                     "role": "assistant",
                     "content": content_blocks,
