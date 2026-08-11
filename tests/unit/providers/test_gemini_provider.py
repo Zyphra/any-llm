@@ -312,10 +312,10 @@ async def test_completion_with_dataclass_response_format() -> None:
         generation_config = call_kwargs["config"]
 
         assert generation_config.response_mime_type == "application/json"
-        assert isinstance(generation_config.response_schema, dict)
-        assert "properties" in generation_config.response_schema
-        assert "name" in generation_config.response_schema["properties"]
-        assert "value" in generation_config.response_schema["properties"]
+        assert isinstance(generation_config.response_json_schema, dict)
+        assert "properties" in generation_config.response_json_schema
+        assert "name" in generation_config.response_json_schema["properties"]
+        assert "value" in generation_config.response_json_schema["properties"]
 
 
 @pytest.mark.asyncio
@@ -330,6 +330,7 @@ async def test_completion_with_dict_json_schema_response_format() -> None:
             "value": {"type": "integer"},
         },
         "required": ["name", "value"],
+        "additionalProperties": False,
     }
     response_format: dict[str, Any] = {
         "type": "json_schema",
@@ -349,7 +350,7 @@ async def test_completion_with_dict_json_schema_response_format() -> None:
         generation_config = call_kwargs["config"]
 
         assert generation_config.response_mime_type == "application/json"
-        assert generation_config.response_schema == expected_schema
+        assert generation_config.response_json_schema == expected_schema
 
 
 @pytest.mark.asyncio
@@ -454,7 +455,7 @@ async def test_stream_with_response_format_passes_generation_config() -> None:
 
     assert call_kwargs["model"] == model
     assert generation_config.response_mime_type == "application/json"
-    assert generation_config.response_schema == expected_schema
+    assert generation_config.response_json_schema == expected_schema
 
 
 @pytest.mark.asyncio
