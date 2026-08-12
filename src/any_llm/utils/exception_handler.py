@@ -338,6 +338,10 @@ def handle_exceptions(*, wrap_streaming: bool = False) -> Callable[[F], F]:
                         yield item
                 except Exception as e:
                     _handle_exception(e, provider_name)
+                finally:
+                    close = getattr(async_iter, "aclose", None) or getattr(async_iter, "close", None)
+                    if close is not None:
+                        await close()
 
             @functools.wraps(func)
             async def streaming_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:

@@ -43,10 +43,11 @@ class MinimaxProvider(XMLReasoningOpenAIProvider):
             return self._convert_completion_response(response)
 
         async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            async for chunk in response:
-                if isinstance(chunk, OpenAIChatCompletionChunk):
-                    if chunk.choices and chunk.choices[0].delta:
-                        yield self._convert_completion_chunk_response(chunk)
+            async with response:
+                async for chunk in response:
+                    if isinstance(chunk, OpenAIChatCompletionChunk):
+                        if chunk.choices and chunk.choices[0].delta:
+                            yield self._convert_completion_chunk_response(chunk)
 
         return wrap_chunks_with_xml_reasoning(chunk_iterator())
 

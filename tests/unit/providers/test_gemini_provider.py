@@ -1,8 +1,8 @@
 import base64
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
-from typing import Any, get_args
-from unittest.mock import AsyncMock, Mock, patch
+from typing import Any, cast, get_args
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from google.genai import types
@@ -1223,6 +1223,28 @@ def test_streaming_completion_multiple_tool_calls_within_chunk_after_prior_chunk
 async def _async_iter_chunks(items: list[Mock]) -> AsyncIterator[Mock]:
     for item in items:
         yield item
+
+
+@pytest.mark.asyncio
+async def test_streaming_via_acompletion_closes_google_sdk_stream_when_cancelled() -> None:
+    """Cancellation must close the generator returned by the Google SDK."""
+    response_stream = MagicMock()
+    response_stream.__aiter__.return_value = iter([Mock()])
+    response_stream.aclose = AsyncMock()
+
+    with mock_gemini_provider() as mock_genai:
+        mock_genai.return_value.aio.models.generate_content_stream = AsyncMock(return_value=response_stream)
+        provider = GeminiProvider(api_key="test-api-key")
+
+        with patch.object(provider, "_convert_completion_chunk_response", return_value=Mock()):
+            result = await provider._acompletion(
+                CompletionParams(model_id="gemini-pro", messages=[{"role": "user", "content": "Hello"}], stream=True)
+            )
+            stream = cast("Any", result)
+            await anext(stream)
+            await stream.aclose()
+
+    response_stream.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
