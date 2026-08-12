@@ -703,6 +703,39 @@ async def test_completion_with_response_format_dict_json_schema() -> None:
         assert call_kwargs["output_config"] == {"format": {"type": "json_schema", "schema": transform_schema(schema)}}
 
 
+def test_convert_response_format_normalizes_type_arrays() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "answer": {"type": ["string", "null"]},
+        },
+        "required": ["code", "answer"],
+        "additionalProperties": False,
+    }
+
+    result = _convert_response_format(
+        {"type": "json_schema", "json_schema": {"name": "CodeStep", "schema": schema}},
+        "anthropic",
+    )
+
+    assert result["format"]["schema"]["properties"]["answer"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+
+@pytest.mark.parametrize(
+    ("type_schema", "error"),
+    [
+        ({"type": []}, "at least one string type"),
+        ({"type": ["string", "null"], "anyOf": [{"type": "string"}]}, "cannot be combined"),
+    ],
+)
+def test_convert_response_format_rejects_invalid_type_arrays(type_schema: dict[str, Any], error: str) -> None:
+    response_format = {"type": "json_schema", "json_schema": {"name": "Invalid", "schema": type_schema}}
+
+    with pytest.raises(ValueError, match=error):
+        _convert_response_format(response_format, "anthropic")
+
+
 @pytest.mark.asyncio
 async def test_completion_with_response_format_dict_json_object_raises() -> None:
     api_key = "test-api-key"
