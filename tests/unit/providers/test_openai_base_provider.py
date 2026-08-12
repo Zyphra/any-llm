@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -103,6 +104,22 @@ def _make_openai_response(text: str) -> Response:
         tool_choice="auto",
         tools=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_completion_stream_closes_openai_sdk_stream_when_cancelled() -> None:
+    """Cancellation must exit the OpenAI SDK stream context."""
+    provider = _ResponsesProvider(api_key="test-key")
+    sdk_stream = MagicMock()
+    sdk_stream.__aiter__.return_value = iter([MagicMock()])
+
+    with patch.object(provider, "_convert_completion_chunk_response", return_value=MagicMock()):
+        result = provider._convert_completion_response_async(cast("Any", sdk_stream))
+        stream = cast("Any", result)
+        await anext(stream)
+        await stream.aclose()
+
+    sdk_stream.__aexit__.assert_awaited_once()
 
 
 def _make_openai_compaction_response() -> Response:

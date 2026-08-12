@@ -53,7 +53,8 @@ def clear_chunk_stream_metadata(chunk: ChatCompletionChunk) -> ChatCompletionChu
     choice.delta.role = None
     choice.delta.tool_calls = None
     choice.delta.extra_content = None
-    chunk.moderation = None
+    if chunk.model_extra is not None:
+        chunk.model_extra["moderation"] = None
     chunk.service_tier = None
     chunk.system_fingerprint = None
     chunk.usage = None
@@ -111,7 +112,8 @@ class XMLReasoningOpenAIProvider(BaseOpenAIProvider):
             return self._convert_completion_response(response)
 
         async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            async for chunk in response:
-                yield self._convert_completion_chunk_response(chunk)
+            async with response:
+                async for chunk in response:
+                    yield self._convert_completion_chunk_response(chunk)
 
         return wrap_chunks_with_xml_reasoning(chunk_iterator())

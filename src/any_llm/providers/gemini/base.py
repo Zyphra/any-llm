@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from typing_extensions import override
@@ -44,7 +45,7 @@ except ImportError as e:
     MISSING_PACKAGES_ERROR = e
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
     from google import genai
 
@@ -329,12 +330,16 @@ class GoogleProvider(AnyLLM):
         converted_kwargs = self._convert_completion_params(params, **kwargs)
 
         if params.stream:
-            response_stream = await self.client.aio.models.generate_content_stream(**converted_kwargs)
+            response_stream = cast(
+                "AsyncGenerator[types.GenerateContentResponse, None]",
+                await self.client.aio.models.generate_content_stream(**converted_kwargs),
+            )
 
             async def _stream() -> AsyncIterator[ChatCompletionChunk]:
                 tool_call_counter: list[int] = [0]
-                async for chunk in response_stream:
-                    yield self._convert_completion_chunk_response(chunk, tool_call_counter=tool_call_counter)
+                async with aclosing(response_stream):
+                    async for chunk in response_stream:
+                        yield self._convert_completion_chunk_response(chunk, tool_call_counter=tool_call_counter)
 
             return _stream()
 

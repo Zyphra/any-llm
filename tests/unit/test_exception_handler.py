@@ -1,4 +1,5 @@
-from typing import Any
+from collections.abc import AsyncGenerator
+from typing import Any, Self, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -21,6 +22,7 @@ from any_llm.utils.exception_handler import (
     _STATUS_ERROR_CLASSES,
     _handle_exception,
     convert_exception,
+    handle_exceptions,
 )
 
 
@@ -504,3 +506,63 @@ def test_status_free_failures_still_use_the_message_patterns() -> None:
     status classifies exactly as it did before."""
     assert type(convert_exception(Exception("Rate limit reached"), "openai")) is RateLimitError
     assert type(convert_exception(TimeoutError("request timed out"), "openai")) is ProviderError
+
+
+@pytest.mark.asyncio
+async def test_streaming_exception_wrapper_closes_wrapped_iterator() -> None:
+    """Closing the public wrapper must close its provider iterator."""
+    closed = False
+
+    async def source() -> AsyncGenerator[str, None]:
+        nonlocal closed
+        try:
+            yield "chunk"
+        finally:
+            closed = True
+
+    class Provider:
+        PROVIDER_NAME = "test"
+
+        @handle_exceptions(wrap_streaming=True)
+        async def stream(self) -> AsyncGenerator[str, None]:
+            return source()
+
+    stream = await Provider().stream()
+    assert await anext(stream) == "chunk"
+
+    await stream.aclose()
+
+    assert closed
+
+
+@pytest.mark.asyncio
+async def test_streaming_exception_wrapper_supports_async_close() -> None:
+    """SDK iterators may expose async close instead of aclose."""
+
+    class _CloseOnlyIterator:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> Self:
+            return self
+
+        async def __anext__(self) -> str:
+            return "chunk"
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class Provider:
+        PROVIDER_NAME = "test"
+
+        @handle_exceptions(wrap_streaming=True)
+        async def stream(self) -> _CloseOnlyIterator:
+            return source
+
+    source = _CloseOnlyIterator()
+    stream = cast("AsyncGenerator[str, None]", await Provider().stream())
+    assert await anext(stream) == "chunk"
+
+    await stream.aclose()
+
+    assert source.closed

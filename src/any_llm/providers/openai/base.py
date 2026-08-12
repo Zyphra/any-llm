@@ -191,8 +191,9 @@ class BaseOpenAIProvider(AnyLLM):
             return self._convert_completion_response(response)
 
         async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            async for chunk in response:
-                yield self._convert_completion_chunk_response(chunk)
+            async with response:
+                async for chunk in response:
+                    yield self._convert_completion_chunk_response(chunk)
 
         return chunk_iterator()
 
