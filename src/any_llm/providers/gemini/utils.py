@@ -175,6 +175,21 @@ def _convert_file_to_part(block: dict[str, Any], provider_name: str) -> types.Pa
     return types.Part.from_uri(file_uri=file_data, mime_type=guessed_type or "application/octet-stream")
 
 
+def _google_thought_signature(extra_content: object) -> bytes | None:
+    """Extract a Gemini thought signature from any-llm's metadata side channel."""
+    if not isinstance(extra_content, dict):
+        return None
+    google_extra = extra_content.get("google")
+    if not isinstance(google_extra, dict):
+        return None
+    thought_signature = google_extra.get("thought_signature")
+    if isinstance(thought_signature, str):
+        # Part's Pydantic validator accepts base64 strings even though its annotation
+        # only advertises bytes.
+        return cast("bytes", thought_signature)
+    return thought_signature if isinstance(thought_signature, bytes) else None
+
+
 def _convert_messages(
     messages: list[dict[str, Any]], provider_name: str = "gemini"
 ) -> tuple[list[types.Content], str | None]:
@@ -205,8 +220,13 @@ def _convert_messages(
             formatted_messages.append(types.Content(role="user", parts=parts))
         elif message["role"] == "assistant":
             parts = []
+            message_thought_signature = _google_thought_signature(message.get("extra_content"))
             if isinstance(content := message.get("content"), str) and content:
-                parts.append(types.Part.from_text(text=content))
+                parts.append(types.Part(text=content, thought_signature=message_thought_signature))
+            elif message_thought_signature is not None:
+                # Streaming Gemini responses can carry a text-part signature on a final
+                # empty-text part. Keep that part when replaying the model turn.
+                parts.append(types.Part(text="", thought_signature=message_thought_signature))
 
             if message.get("tool_calls"):
                 for i, tool_call in enumerate(message["tool_calls"]):
@@ -215,16 +235,13 @@ def _convert_messages(
 
                     # Extract thought_signature if present (OpenAI compatibility format)
                     # SDK accepts base64 string or bytes
-                    thought_signature = None
-                    if extra_content := tool_call.get("extra_content"):
-                        if google_extra := extra_content.get("google"):
-                            thought_signature = google_extra.get("thought_signature")
+                    thought_signature = _google_thought_signature(tool_call.get("extra_content"))
 
                     # For the first function call in parallel calls, if no thought_signature is present,
                     # use the skip validator sentinel per Google's documentation:
                     # https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
                     if i == 0 and thought_signature is None:
-                        thought_signature = "skip_thought_signature_validator"
+                        thought_signature = cast("bytes", "skip_thought_signature_validator")
 
                     parts.append(
                         types.Part(
@@ -239,12 +256,12 @@ def _convert_messages(
                 part = types.Part.from_function_response(
                     name=message.get("name", "unknown"), response=_normalize_tool_response(content_json)
                 )
-                formatted_messages.append(types.Content(role="function", parts=[part]))
+                formatted_messages.append(types.Content(role="user", parts=[part]))
             except json.JSONDecodeError:
                 part = types.Part.from_function_response(
                     name=message.get("name", "unknown"), response={"result": message["content"]}
                 )
-                formatted_messages.append(types.Content(role="function", parts=[part]))
+                formatted_messages.append(types.Content(role="user", parts=[part]))
 
     return formatted_messages, system_instruction
 
@@ -343,11 +360,14 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
         reasoning = None
         tool_calls_list: list[dict[str, Any]] = []
         text_content = None
+        message_extra_content = None
         parts = candidate.content.parts if candidate.content else None
 
         for part in parts or []:
             if getattr(part, "thought", None):
                 reasoning = part.text
+                if extra_content := _thought_signature_extra_content(part):
+                    message_extra_content = extra_content
             elif function_call := getattr(part, "function_call", None):
                 args_dict = {}
                 if args := getattr(function_call, "args", None):
@@ -368,13 +388,23 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
                     tool_call_dict["extra_content"] = extra_content
 
                 tool_calls_list.append(tool_call_dict)
-            elif getattr(part, "text", None):
-                text_content = part.text
+            else:
+                if getattr(part, "text", None):
+                    text_content = part.text
+                # Gemini may put this on an empty final text part, so signature
+                # extraction must not depend on the text being truthy.
+                if extra_content := _thought_signature_extra_content(part):
+                    message_extra_content = extra_content
 
         # Truncated or filtered responses produce a choice even without content or tool
         # calls, e.g. a thinking model that spent the whole max_output_tokens budget on
         # reasoning, so callers see the terminal reason instead of an empty choices list.
-        if tool_calls_list or text_content or mapped_finish_reason in ("length", "content_filter"):
+        if (
+            tool_calls_list
+            or text_content
+            or message_extra_content
+            or mapped_finish_reason in ("length", "content_filter")
+        ):
             choices.append(
                 {
                     "message": {
@@ -382,6 +412,7 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
                         "content": text_content,
                         "reasoning": reasoning,
                         "tool_calls": tool_calls_list or None,
+                        "extra_content": message_extra_content,
                     },
                     "finish_reason": _resolve_finish_reason(mapped_finish_reason, bool(tool_calls_list)) or "stop",
                     "index": 0,
@@ -442,6 +473,7 @@ def _create_openai_chunk_from_google_chunk(
     content = ""
     reasoning_content = ""
     tool_calls_list: list[ChoiceDeltaToolCall] = []
+    message_extra_content = None
 
     # Content can be absent on terminal chunks, e.g. when the response is truncated or
     # filtered before any part is produced; the finish reason must still be surfaced.
@@ -450,6 +482,8 @@ def _create_openai_chunk_from_google_chunk(
     for part in parts or []:
         if part.thought:
             reasoning_content += part.text or ""
+            if extra_content := _thought_signature_extra_content(part):
+                message_extra_content = extra_content
         elif function_call := part.function_call:
             args_dict = {}
             if args := function_call.args:
@@ -475,8 +509,11 @@ def _create_openai_chunk_from_google_chunk(
                     extra_content=extra_content,
                 )
             )
-        elif part.text:
-            content += part.text
+        else:
+            content += part.text or ""
+            # Streaming signatures commonly arrive on a final empty-text part.
+            if extra_content := _thought_signature_extra_content(part):
+                message_extra_content = extra_content
 
     # Unmapped reasons stay None so non-final chunks are not forced to a terminal reason.
     finish_reason = _resolve_finish_reason(_map_finish_reason(candidate.finish_reason), bool(tool_calls_list))
@@ -486,6 +523,7 @@ def _create_openai_chunk_from_google_chunk(
         role="assistant",
         reasoning=Reasoning(content=reasoning_content) if reasoning_content else None,
         tool_calls=tool_calls_list or None,
+        extra_content=message_extra_content,
     )
 
     choice = ChunkChoice(

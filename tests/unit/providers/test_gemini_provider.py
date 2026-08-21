@@ -491,7 +491,7 @@ async def test_completion_inside_agent_loop(agent_loop_messages: list[dict[str, 
         assert len(contents) == 3
         assert contents[0].role == "user"
         assert contents[1].role == "model"
-        assert contents[2].role == "function"
+        assert contents[2].role == "user"
 
 
 @pytest.mark.parametrize("reasoning_effort", [None, *get_args(ReasoningEffort)])
@@ -1085,6 +1085,22 @@ def test_streaming_completion_with_tool_call_no_thought_signature() -> None:
     assert tool_call.extra_content is None
 
 
+def test_streaming_completion_preserves_text_part_thought_signature() -> None:
+    """A text signature can arrive on an empty final streaming part."""
+    original_bytes = b"streamed-text-signature"
+    response = _make_gemini_response(
+        [types.Part(text="", thought_signature=original_bytes)],
+        types.FinishReason.STOP,
+    )
+
+    chunk = _create_openai_chunk_from_google_chunk(response)
+
+    assert chunk.choices[0].delta.content is None
+    assert chunk.choices[0].delta.extra_content == {
+        "google": {"thought_signature": base64.b64encode(original_bytes).decode("utf-8")}
+    }
+
+
 def test_streaming_completion_with_multiple_tool_calls() -> None:
     """Test that streaming chunks handle multiple parallel tool calls."""
     from any_llm.providers.gemini.utils import _create_openai_chunk_from_google_chunk
@@ -1348,6 +1364,23 @@ def test_convert_response_no_thought_signature() -> None:
     assert "extra_content" not in tool_calls[0] or tool_calls[0].get("extra_content") is None
 
 
+def test_convert_response_preserves_text_part_thought_signature() -> None:
+    original_bytes = b"text-signature-bytes"
+    response = _make_gemini_response(
+        [types.Part(text="answer", thought_signature=original_bytes)],
+        types.FinishReason.STOP,
+    )
+
+    response_dict = _convert_response_to_response_dict(response)
+    message_dict = response_dict["choices"][0]["message"]
+
+    expected_extra = {"google": {"thought_signature": base64.b64encode(original_bytes).decode("utf-8")}}
+    assert message_dict["extra_content"] == expected_extra
+
+    completion = GoogleProvider._convert_completion_response((response_dict, "gemini-test"))
+    assert completion.choices[0].message.extra_content == expected_extra
+
+
 def test_convert_messages_with_thought_signature_in_extra_content() -> None:
     # Use valid base64 that round-trips correctly
     original_bytes = b"test-signature-bytes"
@@ -1380,6 +1413,24 @@ def test_convert_messages_with_thought_signature_in_extra_content() -> None:
     assert len(assistant_message.parts) == 2
     assert assistant_message.parts[0].text == "I will check the weather."
     assert assistant_message.parts[1].thought_signature == original_bytes
+
+
+def test_convert_messages_with_text_thought_signature_in_message_extra_content() -> None:
+    original_bytes = b"text-signature-bytes"
+    base64_signature = base64.b64encode(original_bytes).decode("utf-8")
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "The answer is 42.",
+            "extra_content": {"google": {"thought_signature": base64_signature}},
+        }
+    ]
+
+    formatted_messages, _ = _convert_messages(messages)
+
+    assert formatted_messages[0].parts is not None
+    assert formatted_messages[0].parts[0].text == "The answer is 42."
+    assert formatted_messages[0].parts[0].thought_signature == original_bytes
 
 
 def test_convert_messages_with_base64_image() -> None:
@@ -1592,7 +1643,7 @@ def test_convert_messages_tool_response_normalizes_non_objects(
     formatted_messages, _ = _convert_messages(messages)
 
     tool_message = formatted_messages[2]
-    assert tool_message.role == "function"
+    assert tool_message.role == "user"
     assert tool_message.parts is not None
     assert len(tool_message.parts) == 1
     function_response = tool_message.parts[0].function_response
