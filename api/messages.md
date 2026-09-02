@@ -26,9 +26,11 @@ def messages(
     thinking: dict[str, Any] | None = None,
     cache_control: dict[str, Any] | None = None,
     prompt_cache_key: str | None = None,
+    service_tier: str | None = None,
     context_management: dict[str, Any] | None = None,
     betas: list[str] | None = None,
     output_format: type | dict[str, Any] | None = None,
+    timeout: float | None = None,
     api_key: str | None = None,
     api_base: str | None = None,
     client_args: dict[str, Any] | None = None,
@@ -59,9 +61,11 @@ async def amessages(
     thinking: dict[str, Any] | None = None,
     cache_control: dict[str, Any] | None = None,
     prompt_cache_key: str | None = None,
+    service_tier: str | None = None,
     context_management: dict[str, Any] | None = None,
     betas: list[str] | None = None,
     output_format: type | dict[str, Any] | None = None,
+    timeout: float | None = None,
     api_key: str | None = None,
     api_base: str | None = None,
     client_args: dict[str, Any] | None = None,
@@ -89,9 +93,11 @@ async def amessages(
 | `thinking` | `dict[str, Any] \| None` | None | Thinking/reasoning configuration. |
 | `cache_control` | `dict[str, Any] \| None` | None | Cache control configuration for prompt caching. |
 | `prompt_cache_key` | `str \| None` | None | A key to use when reading from or writing to a provider's prompt cache. |
+| `service_tier` | `str \| None` | None | The service tier to use for this request. |
 | `context_management` | `dict[str, Any] \| None` | None | Anthropic context management configuration. The `compact_20260112` strategy requires a supported model. Its `input_tokens` trigger value must be at least 50,000 when provided; see [Anthropic's compaction documentation](https://platform.claude.com/docs/en/build-with-claude/compaction). |
 | `betas` | `list[str] \| None` | None | Anthropic beta identifiers. |
 | `output_format` | `type \| dict[str, Any] \| None` | None | Structured output, mirroring Anthropic's ``messages.parse``/``output_config``. Either a Pydantic ``BaseModel``/dataclass **type** (typed ``parsed_output``) or a raw Anthropic ``output_config`` **dict** for non-Pydantic JSON schemas (``parsed_output`` holds the parsed JSON). The call returns Anthropic's ``ParsedMessage``. Not supported with streaming. |
+| `timeout` | `float \| None` | None | Per-request timeout in seconds, passed through to the provider's client/SDK. An explicit ``None`` is treated the same as omitting it (the provider's default applies), so it cannot request an unbounded timeout. Providers that have no per-request timeout raise `UnsupportedParameterError`; set a timeout on their client via `client_args` instead. |
 | `api_key` | `str \| None` | None | API key for the provider. |
 | `api_base` | `str \| None` | None | Base URL for the provider API. |
 | `client_args` | `dict[str, Any] \| None` | None | Additional provider-specific arguments for client instantiation. |
