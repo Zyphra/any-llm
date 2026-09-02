@@ -21,6 +21,7 @@ from any_llm.providers.anthropic.utils import (
     _convert_models_list,
     _convert_response_format,
     _convert_tool_spec,
+    _normalize_anthropic_type_arrays,
 )
 from any_llm.types.completion import ChatCompletionMessageFunctionToolCall, CompletionParams, ReasoningEffort
 
@@ -722,11 +723,33 @@ def test_convert_response_format_normalizes_type_arrays() -> None:
     assert result["format"]["schema"]["properties"]["answer"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
 
 
+def test_normalize_anthropic_type_arrays_preserves_composition_keywords() -> None:
+    schema = {
+        "type": ["string", "null"],
+        "anyOf": [{"type": "string", "maxLength": 20}, {"type": "null"}],
+    }
+
+    result = _normalize_anthropic_type_arrays(schema)
+
+    assert result == {
+        "anyOf": [
+            {
+                "type": "string",
+                "anyOf": [{"type": "string", "maxLength": 20}, {"type": "null"}],
+            },
+            {
+                "type": "null",
+                "anyOf": [{"type": "string", "maxLength": 20}, {"type": "null"}],
+            },
+        ]
+    }
+
+
 @pytest.mark.parametrize(
     ("type_schema", "error"),
     [
         ({"type": []}, "at least one string type"),
-        ({"type": ["string", "null"], "anyOf": [{"type": "string"}]}, "cannot be combined"),
+        ({"type": ["string", 1]}, "at least one string type"),
     ],
 )
 def test_convert_response_format_rejects_invalid_type_arrays(type_schema: dict[str, Any], error: str) -> None:

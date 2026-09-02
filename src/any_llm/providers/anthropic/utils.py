@@ -501,6 +501,7 @@ def _convert_tool_choice(params: CompletionParams) -> dict[str, Any]:
 
 
 def _normalize_anthropic_type_arrays(value: Any) -> Any:
+    """Rewrite JSON Schema type arrays that ``anthropic.transform_schema`` rejects."""
     if isinstance(value, list):
         return [_normalize_anthropic_type_arrays(item) for item in value]
     if not isinstance(value, dict):
@@ -511,9 +512,6 @@ def _normalize_anthropic_type_arrays(value: Any) -> Any:
         return {key: _normalize_anthropic_type_arrays(item) for key, item in value.items()}
     if not type_value or not all(isinstance(item, str) for item in type_value):
         msg = "JSON Schema type arrays must contain at least one string type"
-        raise ValueError(msg)
-    if any(keyword in value for keyword in ("anyOf", "oneOf", "allOf")):
-        msg = "JSON Schema type arrays cannot be combined with anyOf, oneOf, or allOf"
         raise ValueError(msg)
 
     siblings = {key: item for key, item in value.items() if key != "type"}
