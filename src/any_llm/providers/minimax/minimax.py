@@ -1,4 +1,5 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 from openai._streaming import AsyncStream
@@ -36,14 +37,18 @@ class MinimaxProvider(XMLReasoningOpenAIProvider):
 
     @override
     def _convert_completion_response_async(
-        self, response: OpenAIChatCompletion | AsyncStream[OpenAIChatCompletionChunk]
+        self,
+        response: OpenAIChatCompletion
+        | AsyncStream[OpenAIChatCompletionChunk]
+        | AsyncGenerator[OpenAIChatCompletionChunk, None],
     ) -> ChatCompletion | AsyncIterator[ChatCompletionChunk]:
         """Convert completion response with Minimax-specific chunk filtering."""
         if isinstance(response, OpenAIChatCompletion):
             return self._convert_completion_response(response)
 
         async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            async with response:
+            stream_context = response if isinstance(response, AsyncStream) else aclosing(response)
+            async with stream_context:
                 async for chunk in response:
                     if not isinstance(chunk, OpenAIChatCompletionChunk):
                         continue

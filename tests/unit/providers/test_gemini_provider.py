@@ -2583,6 +2583,7 @@ def test_convert_response_includes_thought_tokens() -> None:
     mock_response.usage_metadata.thoughts_token_count = 405
     mock_response.usage_metadata.total_token_count = 623
     mock_response.usage_metadata.cached_content_token_count = None
+    mock_response.usage_metadata.tool_use_prompt_token_count = None
 
     response_dict = _convert_response_to_response_dict(mock_response)
 
@@ -2612,6 +2613,7 @@ def test_streaming_chunk_includes_thought_tokens() -> None:
     mock_response.usage_metadata.thoughts_token_count = 405
     mock_response.usage_metadata.total_token_count = 623
     mock_response.usage_metadata.cached_content_token_count = None
+    mock_response.usage_metadata.tool_use_prompt_token_count = None
 
     chunk = _create_openai_chunk_from_google_chunk(mock_response)
 
@@ -2640,6 +2642,7 @@ def test_convert_response_without_thought_tokens() -> None:
     mock_response.usage_metadata.thoughts_token_count = None
     mock_response.usage_metadata.total_token_count = 150
     mock_response.usage_metadata.cached_content_token_count = None
+    mock_response.usage_metadata.tool_use_prompt_token_count = None
 
     response_dict = _convert_response_to_response_dict(mock_response)
 
@@ -2667,6 +2670,7 @@ def test_streaming_chunk_without_thought_tokens() -> None:
     mock_response.usage_metadata.thoughts_token_count = None
     mock_response.usage_metadata.total_token_count = 150
     mock_response.usage_metadata.cached_content_token_count = None
+    mock_response.usage_metadata.tool_use_prompt_token_count = None
 
     chunk = _create_openai_chunk_from_google_chunk(mock_response)
 

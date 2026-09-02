@@ -902,8 +902,7 @@ def test_convert_response_includes_cache_creation_tokens() -> None:
     assert result.usage.total_tokens == expected_total_tokens
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens is None
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 13332
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 13332
 
 
 def test_convert_response_without_cache_tokens() -> None:
@@ -967,8 +966,7 @@ def test_streaming_chunk_includes_cache_tokens_in_usage() -> None:
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 13332
     assert result.choices[0].finish_reason is None
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 1024
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 1024
 
 
 @pytest.mark.asyncio

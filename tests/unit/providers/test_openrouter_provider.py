@@ -71,8 +71,7 @@ def test_completion_response_preserves_cache_write_tokens() -> None:
     assert result.usage is not None
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 20
 
 
 def test_completion_chunk_preserves_cache_write_tokens() -> None:
@@ -100,8 +99,7 @@ def test_completion_chunk_preserves_cache_write_tokens() -> None:
     assert result.usage is not None
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 20
 
 
 def test_completion_response_raises_for_terminal_error() -> None:

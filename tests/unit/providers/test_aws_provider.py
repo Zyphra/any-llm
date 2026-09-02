@@ -1024,8 +1024,7 @@ def test_convert_response_extracts_cache_write_tokens() -> None:
     assert result.usage.total_tokens == 170  # 120 + 50
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens is None
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 20
 
 
 def test_convert_response_without_cached_tokens() -> None:
@@ -1105,8 +1104,7 @@ def test_streaming_metadata_chunk_extracts_cached_tokens() -> None:
     assert result.usage.total_tokens == 250
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
-    assert result.usage.prompt_tokens_details.model_extra is not None
-    assert result.usage.prompt_tokens_details.model_extra["cache_write_tokens"] == 20
+    assert result.usage.prompt_tokens_details.cache_write_tokens == 20
 
 
 def test_streaming_metadata_chunk_without_cached_tokens() -> None:
