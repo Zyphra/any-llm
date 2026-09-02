@@ -334,26 +334,28 @@ def _normalize_tool_response(response: Any) -> dict[str, Any]:
 
 
 def _extract_usage_dict(response: types.GenerateContentResponse) -> dict[str, Any]:
-    """Extract usage from a Gemini response as a dict.
+    """Extract Gemini usage using OpenAI-compatible inclusive token counts.
 
     Gemini's ``prompt_token_count`` already includes cached tokens
-    (``cached_content_token_count`` is a subset).
+    (``cached_content_token_count`` is a subset). Gemini reports tool-use prompt
+    tokens and thinking tokens separately, while OpenAI includes those categories
+    in ``prompt_tokens`` and ``completion_tokens`` respectively.
 
-    Reference: https://ai.google.dev/gemini-api/docs/caching
+    Reference: https://ai.google.dev/api/generate-content#UsageMetadata
     """
     metadata = response.usage_metadata
     if metadata is None:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    reasoning_tokens = metadata.thoughts_token_count or 0
     usage: dict[str, Any] = {
-        "prompt_tokens": metadata.prompt_token_count or 0,
-        # thoughts_token_count is billed output and already counted in total_token_count
-        "completion_tokens": (metadata.candidates_token_count or 0) + (metadata.thoughts_token_count or 0),
+        "prompt_tokens": (metadata.prompt_token_count or 0) + (metadata.tool_use_prompt_token_count or 0),
+        "completion_tokens": (metadata.candidates_token_count or 0) + reasoning_tokens,
         "total_tokens": metadata.total_token_count or 0,
     }
-    if metadata.thoughts_token_count:
-        usage["completion_tokens_details"] = CompletionTokensDetails(reasoning_tokens=metadata.thoughts_token_count)
     if metadata.cached_content_token_count:
         usage["prompt_tokens_details"] = PromptTokensDetails(cached_tokens=metadata.cached_content_token_count)
+    if reasoning_tokens:
+        usage["completion_tokens_details"] = CompletionTokensDetails(reasoning_tokens=reasoning_tokens)
     return usage
 
 
@@ -617,17 +619,7 @@ def _create_openai_chunk_from_google_chunk(
 
     usage = None
     if response.usage_metadata:
-        cached_tokens = response.usage_metadata.cached_content_token_count
-        thought_tokens = response.usage_metadata.thoughts_token_count
-        usage = CompletionUsage(
-            prompt_tokens=response.usage_metadata.prompt_token_count or 0,
-            completion_tokens=(response.usage_metadata.candidates_token_count or 0) + (thought_tokens or 0),
-            total_tokens=response.usage_metadata.total_token_count or 0,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens) if cached_tokens else None,
-            completion_tokens_details=CompletionTokensDetails(reasoning_tokens=thought_tokens)
-            if thought_tokens
-            else None,
-        )
+        usage = CompletionUsage.model_validate(_extract_usage_dict(response))
 
     return ChatCompletionChunk(
         id=f"chatcmpl-{time()}",

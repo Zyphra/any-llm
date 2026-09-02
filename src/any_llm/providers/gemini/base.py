@@ -257,14 +257,13 @@ class GoogleProvider(AnyLLM):
                 )
             )
 
-        usage_dict = response_dict.get("usage", {})
-        usage = CompletionUsage(
-            prompt_tokens=usage_dict.get("prompt_tokens", 0),
-            completion_tokens=usage_dict.get("completion_tokens", 0),
-            total_tokens=usage_dict.get("total_tokens", 0),
-            prompt_tokens_details=usage_dict.get("prompt_tokens_details"),
-            completion_tokens_details=usage_dict.get("completion_tokens_details"),
-        )
+        usage_dict = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            **response_dict.get("usage", {}),
+        }
+        usage = CompletionUsage.model_validate(usage_dict)
 
         return ChatCompletion(
             id=response_dict.get("id", ""),
