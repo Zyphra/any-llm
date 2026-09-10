@@ -590,7 +590,13 @@ async def test_completion_with_parallel_tool_calls() -> None:
         {
             "role": "tool",
             "tool_call_id": "toolu_01WhTsYUFmDbsbSZbs9WDciT",
-            "content": "Second Result",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Second Result",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "name": "second_tool",
         },
     ]
@@ -631,7 +637,8 @@ async def test_completion_with_parallel_tool_calls() -> None:
                         {
                             "type": "tool_result",
                             "tool_use_id": "toolu_01WhTsYUFmDbsbSZbs9WDciT",
-                            "content": "Second Result",
+                            "content": [{"type": "text", "text": "Second Result"}],
+                            "cache_control": {"type": "ephemeral"},
                         },
                     ],
                 },
@@ -639,6 +646,7 @@ async def test_completion_with_parallel_tool_calls() -> None:
             system="You are a helpful assistant.",
             max_tokens=DEFAULT_MAX_TOKENS,
         )
+        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
 
 
 @pytest.mark.asyncio
