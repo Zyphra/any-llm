@@ -183,6 +183,20 @@ def _convert_content_for_anthropic(content: list[dict[str, Any]]) -> list[dict[s
     return converted_content
 
 
+def _hoist_tool_result_cache_control(content: object) -> tuple[object, object | None]:
+    if not isinstance(content, list) or not content or not isinstance(content[-1], dict):
+        return content, None
+
+    content_blocks = cast("list[object]", content)
+    final_block = cast("dict[str, object]", content_blocks[-1])
+    if "cache_control" not in final_block:
+        return content, None
+
+    cache_control = final_block["cache_control"]
+    clean_final_block = {key: value for key, value in final_block.items() if key != "cache_control"}
+    return [*content_blocks[:-1], clean_final_block], cache_control
+
+
 def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     """Convert messages to Anthropic format.
 
@@ -228,7 +242,10 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
             elif message["role"] == "tool":
                 # Use tool_call_id from the message itself
                 tool_use_id = message.get("tool_call_id", "")
-                tool_result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": message["content"]}
+                tool_result_content, cache_control = _hoist_tool_result_cache_control(message["content"])
+                tool_result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": tool_result_content}
+                if cache_control is not None:
+                    tool_result["cache_control"] = cache_control
 
                 # Check if the previous message is already a user message with tool_results
                 # If so, merge this tool_result into it
