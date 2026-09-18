@@ -1,6 +1,8 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk as OpenAIChatCompletionChunk
@@ -72,6 +74,47 @@ def test_completion_response_preserves_cache_write_tokens() -> None:
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
     assert result.usage.prompt_tokens_details.cache_write_tokens == 20
+
+
+@pytest.mark.asyncio
+async def test_openrouter_forwards_prompt_cache_key() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek/deepseek-v4.1-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok", "refusal": None},
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenrouterProvider(api_key="test-key", http_client=http_client)
+    try:
+        await provider.amessages(
+            model="deepseek/deepseek-v4.1-flash",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=16,
+            prompt_cache_key="session-1",
+        )
+    finally:
+        await http_client.aclose()
+
+    assert len(requests) == 1
+    assert requests[0].url == httpx.URL("https://openrouter.ai/api/v1/chat/completions")
+    assert json.loads(requests[0].content)["prompt_cache_key"] == "session-1"
 
 
 def test_completion_chunk_preserves_cache_write_tokens() -> None:

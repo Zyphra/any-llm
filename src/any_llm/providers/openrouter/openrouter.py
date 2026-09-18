@@ -34,6 +34,7 @@ class OpenrouterProvider(BaseOpenAIProvider):
     SUPPORTS_RESPONSES = True
     SUPPORTS_COMPLETION_REASONING = True
     SUPPORTS_EMBEDDING = True
+    PROMPT_CACHE_KEY_SUPPORT = "passthrough"
     # OpenRouter does not expose a moderation endpoint.
     SUPPORTS_MODERATION = False
 
