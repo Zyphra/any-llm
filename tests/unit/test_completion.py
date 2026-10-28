@@ -544,6 +544,9 @@ async def test_provider_factory_can_create_all_supported_providers() -> None:
             kwargs["location"] = "test-location"
         if provider_name == "vertexaianthropic":
             kwargs["project_id"] = "test-project"
+        if provider_name == "awsanthropic":
+            kwargs["workspace_id"] = "test-workspace"
+            kwargs["aws_region"] = "us-west-2"
         if provider_name == "sagemaker":
             continue
         if sys.version_info >= (3, 14) and provider_name in _PYTHON_314_INCOMPATIBLE_PROVIDERS:
