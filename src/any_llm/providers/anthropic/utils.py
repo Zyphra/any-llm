@@ -197,7 +197,29 @@ def _hoist_tool_result_cache_control(content: object) -> tuple[object, object | 
     return [*content_blocks[:-1], clean_final_block], cache_control
 
 
-def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+def _join_system_messages(contents: list[Any]) -> str | list[dict[str, Any]] | None:
+    """Join the contents of the system messages into Anthropic's single `system` parameter.
+
+    Text joins with newlines. Once any message carries content blocks (e.g. with `cache_control`), every message
+    becomes text blocks instead, so the blocks and their fields reach Anthropic unchanged.
+    """
+    if not contents:
+        return None
+    if all(isinstance(content, str) for content in contents):
+        return "\n".join(contents)
+    blocks: list[dict[str, Any]] = []
+    for content in contents:
+        if isinstance(content, str):
+            if content:
+                blocks.append({"type": "text", "text": content})
+        else:
+            blocks.extend(content)
+    return blocks
+
+
+def _convert_messages_for_anthropic(
+    messages: list[dict[str, Any]],
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Convert messages to Anthropic format.
 
     - Extract messages with `role=system`.
@@ -205,15 +227,12 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
     - Handle multiple tool calls in a single assistant message.
     - Merge consecutive tool results into a single user message.
     """
-    system_message = None
+    system_contents: list[Any] = []
     filtered_messages: list[dict[str, Any]] = []
 
     for message in messages:
         if message["role"] == "system":
-            if system_message is None:
-                system_message = message["content"]
-            else:
-                system_message += "\n" + message["content"]
+            system_contents.append(message["content"])
         else:
             # Handle messages inside agent loop.
             # See https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview#tool-use-examples
@@ -226,6 +245,8 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
                 content = message.get("content")
                 if isinstance(content, str) and content:
                     content_blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    content_blocks.extend(content)
                 for tool_call in message["tool_calls"]:
                     content_blocks.append(
                         {
@@ -284,7 +305,7 @@ def _convert_messages_for_anthropic(messages: list[dict[str, Any]]) -> tuple[str
             # Only keep Anthropic-compatible fields (strips OpenAI-specific fields like 'refusal')
             filtered_messages.append({"role": message["role"], "content": message.get("content", "")})
 
-    return system_message, filtered_messages
+    return _join_system_messages(system_contents), filtered_messages
 
 
 def _create_openai_chunk_from_anthropic_chunk(chunk: Any, model_id: str) -> ChatCompletionChunk:

@@ -1660,6 +1660,68 @@ def test_convert_messages_tool_call_turn_without_text_emits_only_tool_use(conten
     assert [block["type"] for block in converted[0]["content"]] == ["tool_use"]
 
 
+def test_convert_messages_keeps_list_content_of_a_tool_call_turn() -> None:
+    """Text parts given as a list (e.g. carrying cache_control) replay with the turn, between thinking and tool_use."""
+    from any_llm.providers.anthropic.utils import _convert_messages_for_anthropic
+
+    text_part = {"type": "text", "text": "I will look up the weather.", "cache_control": {"type": "ephemeral"}}
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [text_part],
+            "reasoning": "The user wants the weather.",
+            "extra_content": {"anthropic": {"signature": "sig-12345"}},
+            "tool_calls": [
+                {"id": "toolu_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+            ],
+        },
+    ]
+
+    _, converted = _convert_messages_for_anthropic(messages)
+
+    assert [block["type"] for block in converted[0]["content"]] == ["thinking", "text", "tool_use"]
+    assert converted[0]["content"][1] == text_part
+
+
+def test_convert_messages_joins_text_system_messages_with_newlines() -> None:
+    from any_llm.providers.anthropic.utils import _convert_messages_for_anthropic
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    system, _ = _convert_messages_for_anthropic(messages)
+
+    assert system == "You are helpful.\nBe brief."
+
+
+def test_convert_messages_joins_system_messages_as_blocks_when_any_has_blocks() -> None:
+    """A system message with blocks (e.g. cache_control) keeps them; text messages beside it become text blocks."""
+    from any_llm.providers.anthropic.utils import _convert_messages_for_anthropic
+
+    marked = {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": [marked]},
+        {"role": "system", "content": ""},
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    system, _ = _convert_messages_for_anthropic(messages)
+
+    assert system == [marked, {"type": "text", "text": "Be brief."}]
+
+
+def test_convert_messages_without_system_messages_has_no_system() -> None:
+    from any_llm.providers.anthropic.utils import _convert_messages_for_anthropic
+
+    system, _ = _convert_messages_for_anthropic([{"role": "user", "content": "Hi"}])
+
+    assert system is None
+
+
 def test_convert_messages_keeps_text_when_tool_calls_is_empty() -> None:
     """An assistant turn with text and an empty tool_calls list keeps its text instead of sending content: []."""
     from any_llm.providers.anthropic.utils import _convert_messages_for_anthropic
