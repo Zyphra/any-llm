@@ -32,6 +32,7 @@ class LLMProvider(StrEnum):
     """String enum for supported providers."""
 
     ANTHROPIC = "anthropic"
+    AWSANTHROPIC = "awsanthropic"
     BEDROCK = "bedrock"
     AZURE = "azure"
     AZUREANTHROPIC = "azureanthropic"
