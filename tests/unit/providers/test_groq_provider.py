@@ -173,6 +173,43 @@ def test_to_chat_completion_extracts_cached_tokens() -> None:
     }
 
 
+def test_to_chat_completion_extracts_reasoning_tokens() -> None:
+    """Test that reasoning tokens from Groq usage are extracted into completion_tokens_details."""
+    from groq.types.chat import ChatCompletion as GroqChatCompletion
+
+    from any_llm.providers.groq.utils import to_chat_completion
+
+    response = GroqChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "openai/gpt-oss-20b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "4"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 80,
+                "completion_tokens": 120,
+                "total_tokens": 200,
+                "completion_tokens_details": {"reasoning_tokens": 110},
+            },
+        }
+    )
+
+    result = to_chat_completion(response)
+
+    assert result.usage is not None
+    assert result.usage.completion_tokens == 120
+    assert result.usage.total_tokens == 200
+    assert result.usage.completion_tokens_details is not None
+    assert result.usage.completion_tokens_details.reasoning_tokens == 110
+
+
 def test_to_chat_completion_without_cached_tokens() -> None:
     """Test that prompt_tokens_details is None when no cached tokens are present."""
     from groq.types.chat import ChatCompletion as GroqChatCompletion
@@ -207,6 +244,7 @@ def test_to_chat_completion_without_cached_tokens() -> None:
     assert result.usage.completion_tokens == 50
     assert result.usage.total_tokens == 150
     assert result.usage.prompt_tokens_details is None
+    assert result.usage.completion_tokens_details is None
     assert result.usage.model_extra == {}
 
 
@@ -289,6 +327,44 @@ def test_streaming_chunk_extracts_cached_tokens() -> None:
         "completion_time": 0.03,
         "total_time": 0.04,
     }
+
+
+def test_streaming_chunk_extracts_reasoning_tokens() -> None:
+    """Test that streaming chunks extract reasoning tokens from x_groq usage."""
+    from groq.types.chat import ChatCompletionChunk as GroqChatCompletionChunk
+
+    from any_llm.providers.groq.utils import _create_openai_chunk_from_groq_chunk
+
+    chunk = GroqChatCompletionChunk.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "openai/gpt-oss-20b",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop",
+                }
+            ],
+            "x_groq": {
+                "usage": {
+                    "prompt_tokens": 80,
+                    "completion_tokens": 120,
+                    "total_tokens": 200,
+                    "completion_tokens_details": {"reasoning_tokens": 110},
+                }
+            },
+        }
+    )
+
+    result = _create_openai_chunk_from_groq_chunk(chunk)
+
+    assert result.usage is not None
+    assert result.usage.completion_tokens == 120
+    assert result.usage.completion_tokens_details is not None
+    assert result.usage.completion_tokens_details.reasoning_tokens == 110
 
 
 def test_streaming_chunk_without_timing_details() -> None:
@@ -533,3 +609,40 @@ async def test_groq_aresponses_without_response_format(mock_openai_class: Mock) 
 
     client.responses.parse.assert_not_called()
     assert "text" not in client.responses.create.call_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_replayed_reasoning_content_sent_as_reasoning(stream: bool) -> None:
+    """Groq rejects reasoning_content and extra_content on a message, so a bridged replay carries reasoning instead."""
+    from any_llm.providers.groq.groq import GroqProvider
+
+    tool_calls = [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]
+    with (
+        patch("any_llm.providers.groq.groq.AsyncGroq") as mocked_groq,
+        patch("any_llm.providers.groq.groq.to_chat_completion") as mocked_to_chat_completion,
+    ):
+        provider = GroqProvider(api_key="test-api-key")
+        mocked_groq.return_value.chat.completions.create = AsyncMock(return_value=Mock())
+        mocked_to_chat_completion.return_value = Mock()
+
+        await provider._acompletion(
+            CompletionParams(
+                model_id="openai/gpt-oss-120b",
+                messages=[
+                    {"role": "user", "content": "Weather in Paris?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls,
+                        "reasoning_content": "need the tool",
+                        "extra_content": {"anthropic": {"signature": "sig"}},
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "Error: unavailable"},
+                ],
+                stream=stream,
+            ),
+        )
+
+        sent = mocked_groq.return_value.chat.completions.create.call_args[1]["messages"]
+        assert sent[1] == {"role": "assistant", "content": None, "tool_calls": tool_calls, "reasoning": "need the tool"}

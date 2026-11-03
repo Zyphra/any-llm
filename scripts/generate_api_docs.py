@@ -23,9 +23,11 @@ import any_llm.api as api_module
 from any_llm import AnyLLM
 from any_llm import exceptions as exc_module
 from any_llm.types import completion as completion_types
+from any_llm.types import decide as decide_types
 from any_llm.types import messages as messages_types
 from any_llm.types import provider as provider_types
 from any_llm.types import responses as responses_types
+from any_llm.types import video as video_types
 from any_llm.utils.exception_handler import _REJECTED_REQUEST_STATUSES, _STATUS_ERROR_CLASSES
 
 DOCS_API_DIR = Path(__file__).parent.parent / "docs" / "api"
@@ -550,6 +552,78 @@ async def alist_models(self, **kwargs) -> Sequence[Model]
 ```"""
     )
 
+    # decide / adecide
+    parts.append("")
+    parts.append("### `decide()` / `adecide()`")
+    parts.append("")
+    parts.append(
+        "Answer named yes/no, choice and score questions about a state. See the [Decide](decide.md) reference."
+    )
+    parts.append("")
+    parts.append(
+        """```
+def decide(self, model, state, questions, *, images=None, **kwargs) -> DecideResponse
+async def adecide(self, model, state, questions, *, images=None, timeout=None, **kwargs) -> DecideResponse
+```"""
+    )
+
+    # video_generation / avideo_generation
+    parts.append("")
+    parts.append("### `video_generation()` / `avideo_generation()`")
+    parts.append("")
+    parts.append(
+        "Start a video generation job. The provider returns a `VideoJob` to poll rather than a video. "
+        "See the [Video](video.md) reference."
+    )
+    parts.append("")
+    parts.append(
+        """```
+def video_generation(self, model, prompt, **kwargs) -> VideoJob
+async def avideo_generation(self, model, prompt, *, seconds=None, size=None, seed=None, negative_prompt=None, reference_images=None, first_frame=None, last_frame=None, **kwargs) -> VideoJob
+```"""
+    )
+
+    # retrieve_video / aretrieve_video
+    parts.append("")
+    parts.append("### `retrieve_video()` / `aretrieve_video()`")
+    parts.append("")
+    parts.append("Read a video job's status, and its outputs once it is completed.")
+    parts.append("")
+    parts.append(
+        """```
+def retrieve_video(self, video_id, **kwargs) -> VideoJob
+async def aretrieve_video(self, video_id, **kwargs) -> VideoJob
+```"""
+    )
+
+    # poll_video / apoll_video
+    parts.append("")
+    parts.append("### `poll_video()` / `apoll_video()`")
+    parts.append("")
+    parts.append(
+        "Retrieve a video job until it is `completed` or `failed`, or raise `TimeoutError` after `timeout` seconds."
+    )
+    parts.append("")
+    parts.append(
+        """```
+def poll_video(self, video_id, *, poll_interval=5.0, timeout=600.0, **kwargs) -> VideoJob
+async def apoll_video(self, video_id, *, poll_interval=5.0, timeout=600.0, **kwargs) -> VideoJob
+```"""
+    )
+
+    # download_video / adownload_video
+    parts.append("")
+    parts.append("### `download_video()` / `adownload_video()`")
+    parts.append("")
+    parts.append("Return one entry of `VideoJob.outputs` as bytes, decoding inline data or fetching its URL.")
+    parts.append("")
+    parts.append(
+        """```
+def download_video(self, output, **kwargs) -> bytes
+async def adownload_video(self, output, **kwargs) -> bytes
+```"""
+    )
+
     # create_batch / acreate_batch
     parts.append("")
     parts.append("### `create_batch()` / `acreate_batch()`")
@@ -908,6 +982,92 @@ asyncio.run(main())
     return "\n".join(parts) + "\n"
 
 
+def generate_decide_page() -> str:
+    """Generate api/decide.md."""
+    sync_fn = api_module.decide
+    async_fn = api_module.adecide
+    parsed = _parse_docstring(sync_fn.__doc__)
+
+    parts = [
+        "---",
+        "title: Decide",
+        "description: Answer named yes/no, choice and score questions about a state",
+        "---",
+        "",
+        "The `decide` and `adecide` functions answer named questions about a state (text, a JSON object, or an array) with a provider that supports the decide API. See [Decide](../decide.md) for the providers.",
+        "",
+        "## `any_llm.decide()`",
+        "",
+        _get_signature_block(sync_fn),
+        "",
+        "## `any_llm.adecide()`",
+        "",
+        "Async variant with the same parameters.",
+        "",
+        _get_signature_block(async_fn),
+        "",
+        "## Parameters",
+        "",
+        _param_table(sync_fn, parsed),
+        "",
+        "## Return Value",
+        "",
+        "Returns a [`DecideResponse`](types/decide.md) containing:",
+        "",
+        "- `answers` -- one answer per question, keyed by question name.",
+        "- `nouls`, `choices`, `scores` -- the answers grouped by question type.",
+        "- `model` -- the model that served the request.",
+        "- `usage` -- token usage, when the provider reports it.",
+        "- `id` -- the provider's request ID, when it reports one.",
+        "",
+        "## Usage",
+        "",
+        "### Every question type",
+        "",
+        """```python
+from any_llm import decide
+from any_llm.types.decide import Choice, Noul, Score
+
+result = decide(
+    "typesafe:jev-latest",
+    "I was charged twice. Please fix this ASAP.",
+    {
+        "billing": Noul(instructions="Is this ticket about billing?"),
+        "tone": Choice(instructions="What is the tone?", criteria={"calm": None, "angry": None}),
+        "urgency": Score(instructions="How urgent is this?", criteria=["low", "medium", "high"]),
+    },
+)
+
+print(result.nouls["billing"].noul)
+print(result.choices["tone"].choice)
+print(result.scores["urgency"].score)
+```""",
+        "",
+        "### Async",
+        "",
+        """```python
+import asyncio
+from any_llm import adecide
+from any_llm.types.decide import Noul
+
+async def main():
+    result = await adecide(
+        "typesafe:jev-latest",
+        "I was charged twice.",
+        {"billing": Noul(instructions="Is this ticket about billing?")},
+    )
+    print(result.nouls["billing"].noul)
+
+asyncio.run(main())
+```""",
+        "",
+        '{% hint style="info" %}',
+        "Not all providers support decide. Check the [providers page](../providers.md) for support details, or query `ProviderMetadata.decide` programmatically. A provider that does not support it raises `NotImplementedError`.",
+        "{% endhint %}",
+    ]
+    return "\n".join(parts) + "\n"
+
+
 def generate_list_models_page() -> str:
     """Generate api/list-models.md."""
     sync_fn = api_module.list_models
@@ -1126,7 +1286,7 @@ def generate_exceptions_page() -> str:
         "any-llm provides a unified exception hierarchy so you can handle errors consistently regardless of which provider is being used. When unified exceptions are enabled, provider-specific SDK errors are automatically mapped to the appropriate any-llm exception type.",
         "",
         '{% hint style="info" %}',
-        "**Opt-in Feature:** Unified exception handling is opt-in. Set the `ANY_LLM_UNIFIED_EXCEPTIONS=1` environment variable to enable automatic conversion from provider-specific exceptions.",
+        "**Opt-in Feature:** Unified exception handling is opt-in. Pass `unified_exceptions=True` when creating a provider, or set the `ANY_LLM_UNIFIED_EXCEPTIONS=1` environment variable, to enable automatic conversion from provider-specific exceptions.",
         "{% endhint %}",
         "",
         "## Exception Hierarchy",
@@ -1337,6 +1497,11 @@ class UnsupportedParameterError(AnyLLMError):
     parts.append(
         "One consequence worth noting: a 5xx is always a provider fault, even when its body happens to mention "
         "something like a content policy."
+    )
+    parts.append("")
+    parts.append(
+        "A provider can pick the type itself before the status and message are consulted, for SDK errors whose "
+        "class says more than either. TypeSafe does this: see its provider page for the cases it handles."
     )
 
     # Usage
@@ -1583,7 +1748,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
             "",
             """| Type | Origin | Description |
 |------|--------|-------------|
-| `CompletionUsage` | `openai.types.CompletionUsage` | Token usage counts. |
+| `CompletionUsage` | extends `openai.types.CompletionUsage` | Token usage counts. `prompt_tokens_details` adds `cache_write_tokens` and `cache_creation_token_details`; `completion_tokens_details` adds `image_tokens` (image output tokens, a subset of `completion_tokens`). |
 | `Function` | `openai.types.chat` | Function definition within a tool call. |
 | `Embedding` | `openai.types.Embedding` | Single embedding vector with index. |
 | `ChoiceDeltaToolCall` | `openai.types.chat` | Tool call delta in streaming chunks. |""",
@@ -1994,12 +2159,144 @@ if batch.status == "completed":
     return "\n".join(parts) + "\n"
 
 
+def generate_types_decide_page() -> str:
+    """Generate api/types/decide.md."""
+    parts = [
+        "---",
+        "title: Decide Types",
+        "description: Question and answer models for the decide API",
+        "---",
+        "",
+        "The questions passed to `any_llm.decide()` and `any_llm.adecide()`, and the response they return.",
+        "",
+        "**Import:** `from any_llm.types.decide import Noul, Choice, Score, DecideResponse`",
+        "",
+        "## Questions",
+        "",
+        "Each question is identified by its `type`, so a question can also be passed as a dict with a `type` key.",
+        "",
+    ]
+    for cls in (decide_types.Noul, decide_types.NoulCriteria, decide_types.Choice, decide_types.Score):
+        parts.extend([f"### `{cls.__name__}`", "", inspect.getdoc(cls) or "", "", _pydantic_field_table(cls), ""])
+
+    parts.extend(["## Answers", ""])
+    for cls in (
+        decide_types.NoulAnswer,
+        decide_types.ChoiceAnswer,
+        decide_types.ScoreAnswer,
+        decide_types.UnknownAnswer,
+    ):
+        parts.extend([f"### `{cls.__name__}`", "", inspect.getdoc(cls) or "", "", _pydantic_field_table(cls), ""])
+
+    parts.extend(["## Response", ""])
+    for cls in (decide_types.DecideResponse, decide_types.DecideUsage):
+        parts.extend([f"### `{cls.__name__}`", "", inspect.getdoc(cls) or "", "", _pydantic_field_table(cls), ""])
+
+    parts.append(
+        "`DecideResponse` also exposes the answers grouped by question type as `nouls`, `choices` and `scores`. "
+        "The response, its usage and each answer keep the fields a provider adds; read them from `model_extra`, "
+        "or get them all from `model_dump()`."
+    )
+    return "\n".join(parts) + "\n"
+
+
+def generate_video_page() -> str:
+    """Generate api/video.md."""
+    parts = [
+        "---",
+        "title: Video",
+        "description: Start, poll and download video generation jobs",
+        "---",
+        "",
+        "Video generation is slow, so `video_generation` returns a `VideoJob` rather than a video. "
+        "`retrieve_video` reads the job again, `poll_video` waits for it, and `download_video` fetches the result. "
+        "See [Video Generation](../video.md) for the providers and what each one takes.",
+    ]
+    for sync_fn, async_fn, heading in (
+        (api_module.video_generation, api_module.avideo_generation, "Start a job"),
+        (api_module.retrieve_video, api_module.aretrieve_video, "Read a job"),
+        (api_module.poll_video, api_module.apoll_video, "Wait for a job"),
+        (api_module.download_video, api_module.adownload_video, "Download a video"),
+    ):
+        parsed = _parse_docstring(sync_fn.__doc__)
+        parts.extend(
+            [
+                "",
+                f"## {heading}",
+                "",
+                f"### `any_llm.{sync_fn.__name__}()`",
+                "",
+                _get_signature_block(sync_fn),
+                "",
+                f"### `any_llm.{async_fn.__name__}()`",
+                "",
+                "Async variant with the same parameters.",
+                "",
+                _get_signature_block(async_fn),
+                "",
+                "### Parameters",
+                "",
+                _param_table(sync_fn, parsed),
+            ]
+        )
+    parts.extend(
+        [
+            "",
+            "## Usage",
+            "",
+            """```python
+from any_llm import download_video, poll_video, video_generation
+
+job = video_generation("together:ByteDance/Seedance-2.0", prompt="penguins building a snowman", seconds=5)
+job = poll_video("together", job.id, poll_interval=10, timeout=900)
+if job.status == "completed":
+    video = download_video("together", job.outputs[0])
+    print(f"{len(video)} bytes of {job.outputs[0].mime_type}")
+```""",
+            "",
+            '{% hint style="info" %}',
+            "Not all providers support video generation. Check the [providers page](../providers.md) for support details, or query `ProviderMetadata.video_generation` programmatically. A provider that does not support it raises `NotImplementedError`.",
+            "{% endhint %}",
+        ]
+    )
+    return "\n".join(parts) + "\n"
+
+
+def generate_types_video_page() -> str:
+    """Generate api/types/video.md."""
+    parts = [
+        "---",
+        "title: Video Types",
+        "description: Job, output and parameter models for the video API",
+        "---",
+        "",
+        "The job returned by `any_llm.video_generation()`, `any_llm.retrieve_video()` and `any_llm.poll_video()`, "
+        "and the parameters a provider receives.",
+        "",
+        "**Import:** `from any_llm.types.video import VideoJob, VideoOutput, VideoError`",
+        "",
+        "## Job",
+        "",
+        "`VideoJob.status` is one of `queued`, `in_progress`, `completed` or `failed`; `done` is `True` for the last two.",
+        "",
+    ]
+    for cls in (video_types.VideoJob, video_types.VideoOutput, video_types.VideoError):
+        parts.extend([f"### `{cls.__name__}`", "", inspect.getdoc(cls) or "", "", _pydantic_field_table(cls), ""])
+
+    parts.extend(["## Parameters", ""])
+    for cls in (video_types.VideoGenerationParams,):
+        parts.extend([f"### `{cls.__name__}`", "", inspect.getdoc(cls) or "", "", _pydantic_field_table(cls), ""])
+    return "\n".join(parts)
+
+
 # Map of output file paths to generator functions
 PAGES: dict[str, Any] = {
     "any-llm.md": generate_any_llm_page,
     "completion.md": generate_completion_page,
     "responses.md": generate_responses_page,
     "embedding.md": generate_embedding_page,
+    "decide.md": generate_decide_page,
+    "video.md": generate_video_page,
     "list-models.md": generate_list_models_page,
     "batch.md": generate_batch_page,
     "exceptions.md": generate_exceptions_page,
@@ -2010,6 +2307,8 @@ PAGES: dict[str, Any] = {
     "types/model.md": generate_types_model_page,
     "types/provider.md": generate_types_provider_page,
     "types/batch.md": generate_types_batch_page,
+    "types/decide.md": generate_types_decide_page,
+    "types/video.md": generate_types_video_page,
 }
 
 

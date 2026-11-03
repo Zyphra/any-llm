@@ -36,6 +36,23 @@ INFERENCE_PARAMETERS = ["maxTokens", "temperature", "topP", "stopSequences"]
 # Titan, Llama, ...) have no equivalent verified mechanism, so they keep raising.
 _STRUCTURED_OUTPUT_TOOL_NAME = "any_llm_structured_output"
 
+_FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+
+# The Converse API reports nine stop reasons (botocore's bedrock-runtime service model, shape
+# "StopReason"). OpenAI has no counterpart for "stop_sequence", "malformed_model_output" and
+# "malformed_tool_use", so those fall through to the "stop" default along with any reason a
+# future service model adds. The rest do have one, and without it a guardrail block or a
+# context overflow looks like a normal completion to callers, including the structured-output
+# guard in any_llm.py that is supposed to raise ContentFilterFinishReasonError.
+BEDROCK_STOP_REASON_TO_FINISH_REASON: dict[str, _FinishReason] = {
+    "end_turn": "stop",
+    "max_tokens": "length",
+    "model_context_window_exceeded": "length",
+    "tool_use": "tool_calls",
+    "content_filtered": "content_filter",
+    "guardrail_intervened": "content_filter",
+}
+
 REASONING_EFFORT_TO_THINKING_BUDGETS = {
     "minimal": 1024,
     "low": 2048,
@@ -44,6 +61,13 @@ REASONING_EFFORT_TO_THINKING_BUDGETS = {
     "xhigh": 32768,
     "max": 32768,
 }
+
+
+def _map_stop_reason(stop_reason: Any) -> _FinishReason:
+    """Map a Converse API stopReason onto the OpenAI finish_reason vocabulary."""
+    if not isinstance(stop_reason, str):
+        return "stop"
+    return BEDROCK_STOP_REASON_TO_FINISH_REASON.get(stop_reason, "stop")
 
 
 def _is_anthropic_model(model_id: str) -> bool:
@@ -167,6 +191,19 @@ def _convert_params(params: CompletionParams, kwargs: dict[str, Any]) -> dict[st
         result_kwargs["toolConfig"] = tool_config
 
     reasoning_enabled = params.reasoning_effort is not None and params.reasoning_effort not in ("auto", "none")
+    # An ARN (application inference profile, provisioned throughput, custom or imported model)
+    # may front a Claude model without naming it, so it keeps the Claude shape rather than being refused.
+    opaque_arn = params.model_id.startswith("arn:")
+    if reasoning_enabled and not _is_anthropic_model(params.model_id) and not opaque_arn:
+        # `reasoning_config` with `budget_tokens` is Claude's extended thinking; other model
+        # families on Bedrock each take their own reasoning field, and reject this object.
+        msg = "reasoning_effort"
+        raise UnsupportedParameterError(
+            msg,
+            "bedrock",
+            "reasoning_effort is only translated for Anthropic Claude models on Bedrock. For other models, "
+            "pass the model's own reasoning field in additionalModelRequestFields.",
+        )
 
     inference_config: dict[str, Any] = {}
     if params.max_tokens:
@@ -191,12 +228,32 @@ def _convert_params(params: CompletionParams, kwargs: dict[str, Any]) -> dict[st
 
     system_message, formatted_messages = _convert_messages(params.messages)
     result_kwargs["messages"] = formatted_messages
+    if "toolConfig" not in result_kwargs:
+        replayed_tool_config = _replayed_tool_config(formatted_messages)
+        if replayed_tool_config is not None:
+            result_kwargs["toolConfig"] = replayed_tool_config
     if system_message:
         result_kwargs["system"] = system_message
 
     result_kwargs["modelId"] = params.model_id
 
     return result_kwargs
+
+
+def _replayed_tool_config(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Declare the tools a conversation already called, for a request that declares none.
+
+    Converse refuses a request whose messages hold toolUse or toolResult blocks without a
+    `toolConfig` ("The toolConfig field must be defined when using toolUse and toolResult
+    content blocks"), which is what an agent loop sends when it withholds its tools to make
+    the model answer. Other providers accept that conversation as it is.
+    """
+    names = dict.fromkeys(
+        block["toolUse"]["name"] for message in messages for block in message["content"] if "toolUse" in block
+    )
+    if not names:
+        return None
+    return _convert_tool_spec([{"type": "function", "function": {"name": name}} for name in names], tool_choice=None)
 
 
 def _convert_tool_spec(tools: list[dict[str, Any]], tool_choice: str | dict[str, Any] | None) -> dict[str, Any]:
@@ -423,12 +480,7 @@ def _extract_usage(usage_data: dict[str, Any]) -> CompletionUsage:
     prompt_tokens = input_tokens + cache_read + cache_write
     output_tokens = usage_data.get("outputTokens", 0)
     prompt_tokens_details = (
-        PromptTokensDetails.model_validate(
-            {
-                "cached_tokens": cache_read or None,
-                "cache_write_tokens": cache_write or None,
-            }
-        )
+        PromptTokensDetails(cached_tokens=cache_read or None, cache_write_tokens=cache_write or None)
         if cache_read or cache_write
         else None
     )
@@ -500,9 +552,12 @@ def _convert_response(response: dict[str, Any]) -> ChatCompletion:
         )
 
     if response.get("stopReason") == "tool_use" and tool_calls_list:
+        # The model's own text belongs in its turn, alongside the tool calls it made. Converse
+        # returns it as a separate text block in the same message, and the streaming converter
+        # already forwards those deltas, so dropping it here made the two paths disagree.
         message = ChatCompletionMessage(
             role="assistant",
-            content=None,
+            content="".join(content_parts) or None,
             reasoning=Reasoning(content=reasoning_content) if reasoning_content else None,
             tool_calls=[
                 ChatCompletionMessageFunctionToolCall(
@@ -531,8 +586,7 @@ def _convert_response(response: dict[str, Any]) -> ChatCompletion:
         )
 
     content = "".join(content_parts)
-    stop_reason = response.get("stopReason")
-    finish_reason: Literal["stop", "length"] = "length" if stop_reason == "max_tokens" else "stop"
+    finish_reason = _map_stop_reason(response.get("stopReason"))
 
     message = ChatCompletionMessage(
         role="assistant",
@@ -544,9 +598,7 @@ def _convert_response(response: dict[str, Any]) -> ChatCompletion:
     choices_out.append(
         Choice(
             index=0,
-            finish_reason=cast(
-                "Literal['stop', 'length', 'tool_calls', 'content_filter', 'function_call']", finish_reason
-            ),
+            finish_reason=finish_reason,
             message=message,
         )
     )
@@ -580,7 +632,7 @@ def _create_openai_chunk_from_aws_chunk(
 
     content: str | None = None
     reasoning_content: str | None = None
-    finish_reason: Literal["stop", "length", "tool_calls"] | None = None
+    finish_reason: _FinishReason | None = None
     tool_call: ChoiceDeltaToolCall | None = None
     usage: CompletionUsage | None = None
 
@@ -626,13 +678,7 @@ def _create_openai_chunk_from_aws_chunk(
                 ),
             )
     elif "messageStop" in chunk:
-        stop_reason = chunk["messageStop"]["stopReason"]
-        if stop_reason == "max_tokens":
-            finish_reason = "length"
-        elif stop_reason == "tool_use":
-            finish_reason = "tool_calls"
-        else:
-            finish_reason = "stop"
+        finish_reason = _map_stop_reason(chunk["messageStop"]["stopReason"])
     elif "messageStart" in chunk:
         content = ""
     elif "metadata" in chunk:

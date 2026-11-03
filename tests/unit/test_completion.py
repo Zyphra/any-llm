@@ -17,6 +17,7 @@ from any_llm import AnyLLM
 from any_llm.api import acompletion, aresponses, completion, responses
 from any_llm.constants import LLMProvider
 from any_llm.exceptions import UnsupportedParameterError
+from any_llm.providers.openai.openai import OpenaiProvider
 from any_llm.types.completion import (
     ChatCompletion,
     ChatCompletionMessage,
@@ -25,6 +26,7 @@ from any_llm.types.completion import (
     CompletionParams,
     Function,
     Reasoning,
+    ReasoningEffort,
 )
 
 _PYTHON_314_INCOMPATIBLE_PROVIDERS = {"voyage", "watsonx"}
@@ -170,6 +172,43 @@ async def test_acompletion_rejects_prompt_cache_key_for_unsupported_provider() -
         )
 
     client.converse.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supports_n", [True, False])
+@pytest.mark.parametrize("n", [None, 1])
+async def test_acompletion_drops_default_n_for_every_provider(n: int | None, supports_n: bool) -> None:
+    provider = AnyLLM.create("openai", api_key="sk-test")
+    provider.SUPPORTS_COMPLETION_N = supports_n
+    with patch.object(provider, "_acompletion", new=AsyncMock(return_value=Mock(spec=ChatCompletion))) as mock_ac:
+        await provider.acompletion(model="gpt-4", messages=[{"role": "user", "content": "Hi"}], n=n)
+
+    assert mock_ac.call_args.args[0].n is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n", [2, 0, -1])
+async def test_acompletion_rejects_n_for_provider_without_multiple_choices(n: int) -> None:
+    provider = AnyLLM.create("openai", api_key="sk-test")
+    provider.SUPPORTS_COMPLETION_N = False
+    with (
+        patch.object(provider, "_acompletion", new=AsyncMock()) as mock_ac,
+        pytest.raises(UnsupportedParameterError, match="'n' is not supported for openai") as exc_info,
+    ):
+        await provider.acompletion(model="gpt-4", messages=[{"role": "user", "content": "Hi"}], n=n)
+
+    assert exc_info.value.parameter_name == "n"
+    mock_ac.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_acompletion_forwards_n_to_provider_with_multiple_choices() -> None:
+    provider = OpenaiProvider(api_key="sk-test")
+    assert provider.SUPPORTS_COMPLETION_N
+    with patch.object(provider.client.chat.completions, "create", new=AsyncMock()) as mock_create:
+        await provider.acompletion(model="gpt-4", messages=[{"role": "user", "content": "Hi"}], n=2)
+
+    assert mock_create.call_args.kwargs["n"] == 2
 
 
 def _signed_tool_call_message() -> ChatCompletionMessage:
@@ -491,7 +530,7 @@ async def test_all_providers_can_be_loaded(provider: str) -> None:
         kwargs["project"] = "test-project"
         kwargs["location"] = "test-location"
     if provider == "otari":
-        kwargs["api_base"] = "http://127.0.0.1:8080/v1"
+        kwargs["api_base"] = "http://127.0.0.1:8080"
 
     provider_instance = AnyLLM.create(provider, **kwargs)
 
@@ -549,7 +588,7 @@ async def test_provider_factory_can_create_all_supported_providers() -> None:
         if sys.version_info >= (3, 14) and provider_name in _PYTHON_314_INCOMPATIBLE_PROVIDERS:
             continue
         if provider_name == "otari":
-            kwargs["api_base"] = "http://127.0.0.1:8080/v1"
+            kwargs["api_base"] = "http://127.0.0.1:8080"
         provider_instance = AnyLLM.create(provider_name, **kwargs)
 
         assert isinstance(provider_instance, AnyLLM), f"Failed to create valid AnyLLM instance for {provider_name}"
@@ -636,3 +675,37 @@ def test_sync_completion_can_be_called_repeatedly_on_one_provider() -> None:
 
     assert errors == []
     assert contents == ["Hello", "Hello"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "requested", "sent"),
+    [
+        ("deepseek-ai/DeepSeek-V4.1-Flash", "medium", "high"),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", "minimal", "low"),
+        ("deepseek/deepseek-v4.1-flash", "xhigh", "high"),
+        ("deepseek-v4-1-flash", "low", "low"),
+        ("accounts/fireworks/models/deepseek-v4p1-flash", "max", "max"),
+        ("deepseek-v4.1-flash:thinking", "high", "high"),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", "auto", "auto"),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", None, None),
+        ("deepseek-ai/DeepSeek-V4-Pro", "medium", "high"),
+        ("deepseek-v4-flash", "xhigh", "high"),
+        ("deepseek-ai/DeepSeek-V4-Pro", "low", "low"),
+        ("deepseek-v40-preview", "medium", "medium"),
+        ("deepseek-ai/DeepSeek-V3.2", "medium", "medium"),
+        ("gpt-5", "medium", "medium"),
+    ],
+)
+async def test_acompletion_maps_reasoning_effort_for_deepseek_v4(
+    model: str, requested: ReasoningEffort | None, sent: ReasoningEffort | None
+) -> None:
+    # Hosts serving DeepSeek V4 lack some levels; they map as DeepSeek's own API maps them.
+    provider = AnyLLM.create("nebius", api_key="sk-test")
+    with patch.object(provider, "_acompletion", new=AsyncMock(return_value=Mock(spec=ChatCompletion))) as mock_ac:
+        await provider.acompletion(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_effort=requested,
+        )
+    assert mock_ac.call_args.args[0].reasoning_effort == sent

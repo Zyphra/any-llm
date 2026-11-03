@@ -1,11 +1,11 @@
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from typing import IO, Any, Literal
+from typing import Any, Literal
 
 from openresponses_types import ResponseResource
 
 from any_llm import AnyLLM
 from any_llm.constants import LLMProvider
-from any_llm.types.audio import AudioSpeechParams, AudioTranscriptionParams, Transcription
+from any_llm.types.audio import AudioInput, Transcription
 from any_llm.types.batch import Batch, BatchResult
 from any_llm.types.completion import (
     ChatCompletion,
@@ -14,12 +14,14 @@ from any_llm.types.completion import (
     CreateEmbeddingResponse,
     ReasoningEffort,
 )
-from any_llm.types.image import ImageGenerationParams, ImagesResponse
+from any_llm.types.decide import DecideResponse, JSONContent, QuestionsInput
+from any_llm.types.image import ImageInput, ImagesResponse
 from any_llm.types.messages import MessageResponse, MessageStreamEvent, ParsedBetaMessage, ParsedMessage
 from any_llm.types.model import Model
 from any_llm.types.moderation import ModerationResponse
 from any_llm.types.rerank import RerankResponse
 from any_llm.types.responses import ParsedResponse, Response, ResponseInput, ResponseStreamEvent
+from any_llm.types.video import VideoJob, VideoOutput
 
 
 def completion(
@@ -309,7 +311,7 @@ def responses(
 
     This implements the OpenResponses specification and returns either
     `openresponses_types.ResponseResource` (for OpenResponses-compliant providers)
-    or `openai.types.responses.Response` (for providers using OpenAI's native API).
+    or `openai.types.responses.Response` (for providers using OpenAI's native API, including `openai`).
     If a structured `response_format` type is given, a `ParsedResponse` (with `output_parsed`) is returned.
     If `stream=True`, an iterator of `any_llm.types.responses.ResponseStreamEvent` items is returned.
 
@@ -366,7 +368,7 @@ def responses(
 
     Returns:
         Either a `ResponseResource` object (OpenResponses-compliant providers),
-        a `Response` object (non-compliant providers), a `ParsedResponse` (with
+        a `Response` object (OpenAI's native API, including `openai`), a `ParsedResponse` (with
         `output_parsed`) when a structured `response_format` type is given, or an
         iterator of `ResponseStreamEvent` (streaming).
 
@@ -465,7 +467,7 @@ async def aresponses(
 
     This implements the OpenResponses specification and returns either
     `openresponses_types.ResponseResource` (for OpenResponses-compliant providers)
-    or `openai.types.responses.Response` (for providers using OpenAI's native API).
+    or `openai.types.responses.Response` (for providers using OpenAI's native API, including `openai`).
     If a structured `response_format` type is given, a `ParsedResponse` (with `output_parsed`) is returned.
     If `stream=True`, an iterator of `any_llm.types.responses.ResponseStreamEvent` items is returned.
 
@@ -522,7 +524,7 @@ async def aresponses(
 
     Returns:
         Either a `ResponseResource` object (OpenResponses-compliant providers),
-        a `Response` object (non-compliant providers), a `ParsedResponse` (with
+        a `Response` object (OpenAI's native API, including `openai`), a `ParsedResponse` (with
         `output_parsed`) when a structured `response_format` type is given, or an
         iterator of `ResponseStreamEvent` (streaming).
 
@@ -599,6 +601,7 @@ def messages(
     service_tier: str | None = None,
     context_management: dict[str, Any] | None = None,
     betas: list[str] | None = None,
+    container: str | dict[str, Any] | None = None,
     output_format: type | dict[str, Any] | None = None,
     timeout: float | None = None,
     api_key: str | None = None,
@@ -615,9 +618,9 @@ def messages(
         max_tokens: Maximum number of tokens to generate.
         provider: Provider name to use for the request.
         system: System prompt (string or list of content blocks with optional cache_control).
-        temperature: Controls randomness (0.0 to 1.0).
-        top_p: Controls diversity via nucleus sampling.
-        top_k: Only sample from the top K options.
+        temperature: Controls randomness. Anthropic deprecates this for current Claude models.
+        top_p: Controls nucleus sampling. Anthropic deprecates this for current Claude models.
+        top_k: Restricts sampling to the top K options. Anthropic deprecates this for current Claude models.
         stream: Whether to stream the response.
         stop_sequences: Custom stop sequences.
         tools: List of tools in Anthropic format.
@@ -631,11 +634,19 @@ def messages(
             strategy requires a supported model. Its `input_tokens` trigger value must be at
             least 50,000 when provided; see [Anthropic's compaction documentation](https://platform.claude.com/docs/en/build-with-claude/compaction).
         betas: Anthropic beta identifiers.
+        container: Container identifier, or an object with optional ``id`` and ``skills``.
+            A string reuses an existing container. An object selects Skills for a fresh
+            container or reuses one while attaching Skills. See
+            [Anthropic's Skills container parameter](https://platform.claude.com/docs/en/build-with-claude/skills-guide#container-parameter).
         output_format: Structured output, mirroring Anthropic's ``messages.parse``/``output_config``.
             Either a Pydantic ``BaseModel``/dataclass **type** (typed ``parsed_output``) or a raw
             Anthropic ``output_config`` **dict** for non-Pydantic JSON schemas (``parsed_output``
-            holds the parsed JSON). The call returns Anthropic's ``ParsedMessage``. Not supported
-            with streaming.
+            holds the parsed JSON). Non-streaming calls return Anthropic's ``ParsedMessage``
+            for types or mappings with a non-empty schema dict. Mappings without one return
+            ``MessageResponse``. Providers with native support can stream schema-constrained
+            Messages events.
+            Native Anthropic typed beta requests return ``ParsedBetaMessage`` when
+            ``context_management`` is set or beta identifiers are supplied.
         timeout: Per-request timeout in seconds, passed through to the provider's client/SDK.
             An explicit ``None`` is treated the same as omitting it (the provider's default
             applies), so it cannot request an unbounded timeout. Providers that have no
@@ -647,8 +658,9 @@ def messages(
         **kwargs: Additional provider-specific arguments.
 
     Returns:
-        MessageResponse (or ParsedMessage when `output_format` is given), or an iterator of
-        MessageStreamEvent (if streaming).
+        MessageResponse, or ParsedMessage for a typed or schema-backed `output_format`.
+        Native Anthropic typed beta requests return ParsedBetaMessage instead.
+        Streaming calls return an iterator of MessageStreamEvent.
 
     """
     if provider is None:
@@ -677,6 +689,7 @@ def messages(
         service_tier=service_tier,
         context_management=context_management,
         betas=betas,
+        container=container,
         output_format=output_format,
         timeout=timeout,
         **kwargs,
@@ -704,6 +717,7 @@ async def amessages(
     service_tier: str | None = None,
     context_management: dict[str, Any] | None = None,
     betas: list[str] | None = None,
+    container: str | dict[str, Any] | None = None,
     output_format: type | dict[str, Any] | None = None,
     timeout: float | None = None,  # noqa: ASYNC109  # forwarded to the provider SDK, which owns the timeout
     api_key: str | None = None,
@@ -720,9 +734,9 @@ async def amessages(
         max_tokens: Maximum number of tokens to generate.
         provider: Provider name to use for the request.
         system: System prompt (string or list of content blocks with optional cache_control).
-        temperature: Controls randomness (0.0 to 1.0).
-        top_p: Controls diversity via nucleus sampling.
-        top_k: Only sample from the top K options.
+        temperature: Controls randomness. Anthropic deprecates this for current Claude models.
+        top_p: Controls nucleus sampling. Anthropic deprecates this for current Claude models.
+        top_k: Restricts sampling to the top K options. Anthropic deprecates this for current Claude models.
         stream: Whether to stream the response.
         stop_sequences: Custom stop sequences.
         tools: List of tools in Anthropic format.
@@ -736,11 +750,19 @@ async def amessages(
             strategy requires a supported model. Its `input_tokens` trigger value must be at
             least 50,000 when provided; see [Anthropic's compaction documentation](https://platform.claude.com/docs/en/build-with-claude/compaction).
         betas: Anthropic beta identifiers.
+        container: Container identifier, or an object with optional ``id`` and ``skills``.
+            A string reuses an existing container. An object selects Skills for a fresh
+            container or reuses one while attaching Skills. See
+            [Anthropic's Skills container parameter](https://platform.claude.com/docs/en/build-with-claude/skills-guide#container-parameter).
         output_format: Structured output, mirroring Anthropic's ``messages.parse``/``output_config``.
             Either a Pydantic ``BaseModel``/dataclass **type** (typed ``parsed_output``) or a raw
             Anthropic ``output_config`` **dict** for non-Pydantic JSON schemas (``parsed_output``
-            holds the parsed JSON). The call returns Anthropic's ``ParsedMessage``. Not supported
-            with streaming.
+            holds the parsed JSON). Non-streaming calls return Anthropic's ``ParsedMessage``
+            for types or mappings with a non-empty schema dict. Mappings without one return
+            ``MessageResponse``. Providers with native support can stream schema-constrained
+            Messages events.
+            Native Anthropic typed beta requests return ``ParsedBetaMessage`` when
+            ``context_management`` is set or beta identifiers are supplied.
         timeout: Per-request timeout in seconds, passed through to the provider's client/SDK.
             An explicit ``None`` is treated the same as omitting it (the provider's default
             applies), so it cannot request an unbounded timeout. Providers that have no
@@ -752,8 +774,9 @@ async def amessages(
         **kwargs: Additional provider-specific arguments.
 
     Returns:
-        MessageResponse (or ParsedMessage when `output_format` is given), or an async iterator
-        of MessageStreamEvent (if streaming).
+        MessageResponse, or ParsedMessage for a typed or schema-backed `output_format`.
+        Native Anthropic typed beta requests return ParsedBetaMessage instead.
+        Streaming calls return an async iterator of MessageStreamEvent.
 
     """
     if provider is None:
@@ -782,6 +805,7 @@ async def amessages(
         service_tier=service_tier,
         context_management=context_management,
         betas=betas,
+        container=container,
         output_format=output_format,
         timeout=timeout,
         **kwargs,
@@ -967,26 +991,146 @@ async def aimage_generation(
         model_name = model
 
     llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
-    return await llm._aimage_generation(
-        ImageGenerationParams(
-            model_id=model_name,
-            prompt=prompt,
-            n=n,
-            size=size,
-            quality=quality,
-            style=style,
-            response_format=response_format,
-            user=user,
-        ),
+    return await llm.aimage_generation(
+        model_name,
+        prompt,
+        n=n,
+        size=size,
+        quality=quality,
+        style=style,
+        response_format=response_format,
+        user=user,
+        **kwargs,
+    )
+
+
+def image_edit(
+    model: str,
+    image: ImageInput,
+    prompt: str,
+    *,
+    provider: str | LLMProvider | None = None,
+    n: int | None = None,
+    size: str | None = None,
+    quality: str | None = None,
+    response_format: Literal["url", "b64_json"] | None = None,
+    user: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> ImagesResponse:
+    """Edit or extend one or more images from a text prompt.
+
+    Args:
+        model: Model identifier. **Recommended**: Use with separate `provider` parameter (e.g., model='gpt-image-1', provider='openai').
+            **Alternative**: Combined format 'provider:model' (e.g., 'openai:gpt-image-1').
+        image: The image to edit, or a list of images. Each is bytes, a path, a readable binary
+            file object, or a `(filename, content, content_type)` tuple. PNG, JPEG and WEBP bytes
+            are uploaded under their content type.
+        prompt: A text description of the desired image(s).
+        provider: Provider name to use for the request (e.g., 'openai').
+        n: Number of images to generate.
+        size: Size of the generated images (e.g., '1024x1024').
+        quality: Quality of the generated images (e.g., 'low', 'medium', 'high').
+        response_format: Format of the generated images ('url' or 'b64_json').
+        user: Unique identifier for the end user.
+        api_key: API key for the provider.
+        api_base: Base URL for the provider API.
+        client_args: Additional provider-specific arguments for client instantiation.
+        **kwargs: Additional provider-specific arguments.
+
+    Returns:
+        The image edit response from the provider.
+
+    """
+    if provider is None:
+        provider_key, model_name = AnyLLM.split_model_provider(model)
+    else:
+        provider_key = AnyLLM.resolve_provider_key(provider)
+        model_name = model
+
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
+    return llm._image_edit(
+        model_name,
+        image,
+        prompt,
+        n=n,
+        size=size,
+        quality=quality,
+        response_format=response_format,
+        user=user,
+        **kwargs,
+    )
+
+
+async def aimage_edit(
+    model: str,
+    image: ImageInput,
+    prompt: str,
+    *,
+    provider: str | LLMProvider | None = None,
+    n: int | None = None,
+    size: str | None = None,
+    quality: str | None = None,
+    response_format: Literal["url", "b64_json"] | None = None,
+    user: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> ImagesResponse:
+    """Edit or extend one or more images from a text prompt asynchronously.
+
+    Args:
+        model: Model identifier. **Recommended**: Use with separate `provider` parameter (e.g., model='gpt-image-1', provider='openai').
+            **Alternative**: Combined format 'provider:model' (e.g., 'openai:gpt-image-1').
+        image: The image to edit, or a list of images. Each is bytes, a path, a readable binary
+            file object, or a `(filename, content, content_type)` tuple. PNG, JPEG and WEBP bytes
+            are uploaded under their content type.
+        prompt: A text description of the desired image(s).
+        provider: Provider name to use for the request (e.g., 'openai').
+        n: Number of images to generate.
+        size: Size of the generated images (e.g., '1024x1024').
+        quality: Quality of the generated images (e.g., 'low', 'medium', 'high').
+        response_format: Format of the generated images ('url' or 'b64_json').
+        user: Unique identifier for the end user.
+        api_key: API key for the provider.
+        api_base: Base URL for the provider API.
+        client_args: Additional provider-specific arguments for client instantiation.
+        **kwargs: Additional provider-specific arguments.
+
+    Returns:
+        The image edit response from the provider.
+
+    """
+    if provider is None:
+        provider_key, model_name = AnyLLM.split_model_provider(model)
+    else:
+        provider_key = AnyLLM.resolve_provider_key(provider)
+        model_name = model
+
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
+    return await llm.aimage_edit(
+        model_name,
+        image,
+        prompt,
+        n=n,
+        size=size,
+        quality=quality,
+        response_format=response_format,
+        user=user,
         **kwargs,
     )
 
 
 def transcription(
     model: str,
-    file: bytes | IO[bytes],
+    file: AudioInput,
     *,
     provider: str | LLMProvider | None = None,
+    filename: str | None = None,
+    mime_type: str | None = None,
     language: str | None = None,
     prompt: str | None = None,
     response_format: str | None = None,
@@ -1003,9 +1147,14 @@ def transcription(
         model: Model identifier. **Recommended**: Use with separate `provider` parameter
             (e.g., model='whisper-1', provider='openai').
             **Alternative**: Combined format 'provider:model' (e.g., 'openai:whisper-1').
-        file: Audio file content as bytes or file-like object.
+        file: Audio to transcribe: bytes, a readable binary file object, or a path.
             Supported formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
         provider: Provider name to use for the request (e.g., 'openai').
+        filename: Name to upload the audio under. Defaults to the path or file object's name,
+            else a name derived from the audio format found in the bytes. Providers reject
+            audio whose name and content type do not identify its format.
+        mime_type: Content type to upload the audio under. Defaults to one guessed from
+            `filename`, else from the bytes.
         language: The language of the input audio in ISO-639-1 format.
         prompt: Optional text to guide the model's style or continue a previous segment.
         response_format: Output format: 'json', 'text', 'srt', 'verbose_json', or 'vtt'.
@@ -1031,6 +1180,8 @@ def transcription(
     return llm._transcription(
         model_name,
         file,
+        filename=filename,
+        mime_type=mime_type,
         language=language,
         prompt=prompt,
         response_format=response_format,
@@ -1042,9 +1193,11 @@ def transcription(
 
 async def atranscription(
     model: str,
-    file: bytes | IO[bytes],
+    file: AudioInput,
     *,
     provider: str | LLMProvider | None = None,
+    filename: str | None = None,
+    mime_type: str | None = None,
     language: str | None = None,
     prompt: str | None = None,
     response_format: str | None = None,
@@ -1061,9 +1214,14 @@ async def atranscription(
         model: Model identifier. **Recommended**: Use with separate `provider` parameter
             (e.g., model='whisper-1', provider='openai').
             **Alternative**: Combined format 'provider:model' (e.g., 'openai:whisper-1').
-        file: Audio file content as bytes or file-like object.
+        file: Audio to transcribe: bytes, a readable binary file object, or a path.
             Supported formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
         provider: Provider name to use for the request (e.g., 'openai').
+        filename: Name to upload the audio under. Defaults to the path or file object's name,
+            else a name derived from the audio format found in the bytes. Providers reject
+            audio whose name and content type do not identify its format.
+        mime_type: Content type to upload the audio under. Defaults to one guessed from
+            `filename`, else from the bytes.
         language: The language of the input audio in ISO-639-1 format.
         prompt: Optional text to guide the model's style or continue a previous segment.
         response_format: Output format: 'json', 'text', 'srt', 'verbose_json', or 'vtt'.
@@ -1086,16 +1244,16 @@ async def atranscription(
         model_name = model
 
     llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
-    return await llm._atranscription(
-        AudioTranscriptionParams(
-            model_id=model_name,
-            file=file,
-            language=language,
-            prompt=prompt,
-            response_format=response_format,  # type: ignore[arg-type]
-            temperature=temperature,
-            timestamp_granularities=timestamp_granularities,  # type: ignore[arg-type]
-        ),
+    return await llm.atranscription(
+        model_name,
+        file,
+        filename=filename,
+        mime_type=mime_type,
+        language=language,
+        prompt=prompt,
+        response_format=response_format,  # type: ignore[arg-type]
+        temperature=temperature,
+        timestamp_granularities=timestamp_granularities,  # type: ignore[arg-type]
         **kwargs,
     )
 
@@ -1195,15 +1353,13 @@ async def aspeech(
         model_name = model
 
     llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
-    return await llm._aspeech(
-        AudioSpeechParams(
-            model_id=model_name,
-            input=input,
-            voice=voice,
-            instructions=instructions,
-            response_format=response_format,  # type: ignore[arg-type]
-            speed=speed,
-        ),
+    return await llm.aspeech(
+        model_name,
+        input,
+        voice,
+        instructions=instructions,
+        response_format=response_format,  # type: ignore[arg-type]
+        speed=speed,
         **kwargs,
     )
 
@@ -1273,29 +1429,26 @@ async def amoderation(
     return await llm._amoderation(model_name, input, **kwargs)
 
 
-def _resolve_rerank_target(
+def _resolve_llm(
     model: str,
     provider: str | LLMProvider | None,
-    top_n: int | None,
-    max_tokens_per_doc: int | None,
     api_key: str | None,
     api_base: str | None,
     client_args: dict[str, Any] | None,
-    kwargs: dict[str, Any],
-) -> tuple[AnyLLM, str, dict[str, Any]]:
+) -> tuple[AnyLLM, str]:
+    """Create the provider for ``model`` and return it with the bare model name.
+
+    Called only by the public functions, so the legacy-format warning is raised one frame
+    further up than usual to still point at the caller's line.
+    """
     if provider is None:
-        provider_key, model_name = AnyLLM.split_model_provider(model)
+        provider_key, model_name = AnyLLM.split_model_provider(model, stacklevel=4)
     else:
         provider_key = AnyLLM.resolve_provider_key(provider)
         model_name = model
 
-    if top_n is not None:
-        kwargs["top_n"] = top_n
-    if max_tokens_per_doc is not None:
-        kwargs["max_tokens_per_doc"] = max_tokens_per_doc
-
     llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
-    return llm, model_name, kwargs
+    return llm, model_name
 
 
 def rerank(
@@ -1332,9 +1485,11 @@ def rerank(
         NotImplementedError: If the provider does not support reranking.
 
     """
-    llm, model_name, kwargs = _resolve_rerank_target(
-        model, provider, top_n, max_tokens_per_doc, api_key, api_base, client_args, kwargs
-    )
+    if top_n is not None:
+        kwargs["top_n"] = top_n
+    if max_tokens_per_doc is not None:
+        kwargs["max_tokens_per_doc"] = max_tokens_per_doc
+    llm, model_name = _resolve_llm(model, provider, api_key, api_base, client_args)
     return llm._rerank(model_name, query, documents, **kwargs)
 
 
@@ -1355,10 +1510,72 @@ async def arerank(
 
     See rerank() for full documentation.
     """
-    llm, model_name, kwargs = _resolve_rerank_target(
-        model, provider, top_n, max_tokens_per_doc, api_key, api_base, client_args, kwargs
-    )
-    return await llm._arerank(model_name, query, documents, **kwargs)
+    if top_n is not None:
+        kwargs["top_n"] = top_n
+    if max_tokens_per_doc is not None:
+        kwargs["max_tokens_per_doc"] = max_tokens_per_doc
+    llm, model_name = _resolve_llm(model, provider, api_key, api_base, client_args)
+    return await llm.arerank(model_name, query, documents, **kwargs)
+
+
+def decide(
+    model: str,
+    state: JSONContent,
+    questions: QuestionsInput,
+    *,
+    provider: str | LLMProvider | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    images: list[str] | None = None,
+    **kwargs: Any,
+) -> DecideResponse:
+    """Answer named yes/no, choice, and score questions about a state.
+
+    Args:
+        model: Provider-prefixed model ID (e.g., "typesafe:jev-latest").
+        state: Text, a JSON object, or an array the questions refer to.
+        questions: Names mapped to `Noul`, `Choice` or `Score` questions, their dict forms, or
+            objects with the same attributes.
+        provider: Provider name or enum. Inferred from model string if omitted.
+        api_key: Provider API key. Falls back to environment variable.
+        api_base: Provider API base URL. Falls back to environment variable.
+        client_args: Additional arguments passed to the provider client constructor.
+        images: Images the questions refer to, as data URLs (`data:image/...;base64,...`).
+            Providers that do not accept images raise `UnsupportedParameterError`.
+        **kwargs: Additional arguments for the call, such as `timeout` in seconds.
+
+    Returns:
+        DecideResponse with one answer per question, keyed by question name.
+
+    Raises:
+        NotImplementedError: If the provider does not support decide. Raised as is, with or
+            without unified exceptions.
+        pydantic.ValidationError: If `questions` is not a mapping of valid questions.
+
+    """
+    llm, model_name = _resolve_llm(model, provider, api_key, api_base, client_args)
+    return llm.decide(model_name, state, questions, images=images, **kwargs)
+
+
+async def adecide(
+    model: str,
+    state: JSONContent,
+    questions: QuestionsInput,
+    *,
+    provider: str | LLMProvider | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    images: list[str] | None = None,
+    **kwargs: Any,
+) -> DecideResponse:
+    """Answer named yes/no, choice, and score questions about a state (async).
+
+    See decide() for full documentation.
+    """
+    llm, model_name = _resolve_llm(model, provider, api_key, api_base, client_args)
+    return await llm.adecide(model_name, state, questions, images=images, **kwargs)
 
 
 def list_models(
@@ -1586,7 +1803,7 @@ def list_batches(
     Args:
         provider: Provider name to use for the request (e.g., 'openai', 'mistral')
         after: A cursor for pagination. Returns batches after this batch ID.
-        limit: Maximum number of batches to return (default: 20)
+        limit: Maximum number of batches to return. When omitted, the provider's own default applies.
         api_key: API key for the provider
         api_base: Base URL for the provider API
         client_args: Additional provider-specific arguments for client instantiation
@@ -1615,7 +1832,7 @@ async def alist_batches(
     Args:
         provider: Provider name to use for the request (e.g., 'openai', 'mistral')
         after: A cursor for pagination. Returns batches after this batch ID.
-        limit: Maximum number of batches to return (default: 20)
+        limit: Maximum number of batches to return. When omitted, the provider's own default applies.
         api_key: API key for the provider
         api_base: Base URL for the provider API
         client_args: Additional provider-specific arguments for client instantiation
@@ -1681,3 +1898,307 @@ async def aretrieve_batch_results(
     """
     llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
     return await llm.aretrieve_batch_results(batch_id, **kwargs)
+
+
+def video_generation(
+    model: str,
+    prompt: str,
+    *,
+    provider: str | LLMProvider | None = None,
+    seconds: int | None = None,
+    size: str | None = None,
+    seed: int | None = None,
+    negative_prompt: str | None = None,
+    reference_images: list[str] | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Start a video generation job.
+
+    Video generation is slow, so the provider returns a job rather than a video. Poll it with
+    `retrieve_video`, or wait with `poll_video`, until `VideoJob.done`.
+
+    Args:
+        model: Model identifier. **Recommended**: Use with separate `provider` parameter (e.g., model='ByteDance/Seedance-2.0', provider='together').
+            **Alternative**: Combined format 'provider:model' (e.g., 'together:ByteDance/Seedance-2.0').
+        provider: Provider name to use for the request (e.g., 'together').
+        prompt: A text description of the desired video.
+        seconds: Length of the video in seconds.
+        size: Size of the video as ``WIDTHxHEIGHT`` (e.g., '1280x720').
+        seed: Seed for reproducible generation.
+        negative_prompt: What the video should not contain.
+        reference_images: Image URLs the video should take its subjects or style from.
+        first_frame: Image URL to start the video from.
+        last_frame: Image URL to end the video on.
+        api_key: API key for the provider.
+        api_base: Base URL for the provider API.
+        client_args: Additional provider-specific arguments for client instantiation.
+        **kwargs: Additional provider-specific arguments.
+
+    Returns:
+        The video job, usually still `queued` or `in_progress`.
+
+    """
+    if provider is None:
+        provider_key, model_name = AnyLLM.split_model_provider(model)
+    else:
+        provider_key = AnyLLM.resolve_provider_key(provider)
+        model_name = model
+
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
+    return llm.video_generation(
+        model_name,
+        prompt,
+        seconds=seconds,
+        size=size,
+        seed=seed,
+        negative_prompt=negative_prompt,
+        reference_images=reference_images,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        **kwargs,
+    )
+
+
+async def avideo_generation(
+    model: str,
+    prompt: str,
+    *,
+    provider: str | LLMProvider | None = None,
+    seconds: int | None = None,
+    size: str | None = None,
+    seed: int | None = None,
+    negative_prompt: str | None = None,
+    reference_images: list[str] | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Start a video generation job asynchronously.
+
+    Video generation is slow, so the provider returns a job rather than a video. Poll it with
+    `aretrieve_video`, or wait with `apoll_video`, until `VideoJob.done`.
+
+    Args:
+        model: Model identifier. **Recommended**: Use with separate `provider` parameter (e.g., model='ByteDance/Seedance-2.0', provider='together').
+            **Alternative**: Combined format 'provider:model' (e.g., 'together:ByteDance/Seedance-2.0').
+        provider: Provider name to use for the request (e.g., 'together').
+        prompt: A text description of the desired video.
+        seconds: Length of the video in seconds.
+        size: Size of the video as ``WIDTHxHEIGHT`` (e.g., '1280x720').
+        seed: Seed for reproducible generation.
+        negative_prompt: What the video should not contain.
+        reference_images: Image URLs the video should take its subjects or style from.
+        first_frame: Image URL to start the video from.
+        last_frame: Image URL to end the video on.
+        api_key: API key for the provider.
+        api_base: Base URL for the provider API.
+        client_args: Additional provider-specific arguments for client instantiation.
+        **kwargs: Additional provider-specific arguments.
+
+    Returns:
+        The video job, usually still `queued` or `in_progress`.
+
+    """
+    if provider is None:
+        provider_key, model_name = AnyLLM.split_model_provider(model)
+    else:
+        provider_key = AnyLLM.resolve_provider_key(provider)
+        model_name = model
+
+    llm = AnyLLM.create(provider_key, api_key=api_key, api_base=api_base, **client_args or {})
+    return await llm.avideo_generation(
+        model_name,
+        prompt,
+        seconds=seconds,
+        size=size,
+        seed=seed,
+        negative_prompt=negative_prompt,
+        reference_images=reference_images,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        **kwargs,
+    )
+
+
+def retrieve_video(
+    provider: str | LLMProvider,
+    video_id: str,
+    *,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Retrieve a video job.
+
+    Args:
+        provider: Provider name to use for the request (e.g., 'together')
+        video_id: The ID of the video job to retrieve
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments
+
+    Returns:
+        The video job with its current status, and its outputs once completed.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return llm.retrieve_video(video_id, **kwargs)
+
+
+async def aretrieve_video(
+    provider: str | LLMProvider,
+    video_id: str,
+    *,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Retrieve a video job asynchronously.
+
+    Args:
+        provider: Provider name to use for the request (e.g., 'together')
+        video_id: The ID of the video job to retrieve
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments
+
+    Returns:
+        The video job with its current status, and its outputs once completed.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return await llm.aretrieve_video(video_id, **kwargs)
+
+
+def poll_video(
+    provider: str | LLMProvider,
+    video_id: str,
+    *,
+    poll_interval: float = 5.0,
+    timeout: float | None = 600.0,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Wait for a video job to finish.
+
+    Args:
+        provider: Provider name to use for the request (e.g., 'together')
+        video_id: The ID of the video job to wait for
+        poll_interval: Seconds to wait between retrievals
+        timeout: Seconds to wait in total before giving up, or `None` to wait forever
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments passed to each retrieval
+
+    Returns:
+        The finished video job. A `failed` job is returned, not raised, so its `error` can be read.
+
+    Raises:
+        TimeoutError: If the job is still running after `timeout` seconds.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return llm.poll_video(video_id, poll_interval=poll_interval, timeout=timeout, **kwargs)
+
+
+async def apoll_video(
+    provider: str | LLMProvider,
+    video_id: str,
+    *,
+    poll_interval: float = 5.0,
+    timeout: float | None = 600.0,  # noqa: ASYNC109  # total wait across polls, enforced by AnyLLM.apoll_video
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> VideoJob:
+    """Wait for a video job to finish asynchronously.
+
+    Args:
+        provider: Provider name to use for the request (e.g., 'together')
+        video_id: The ID of the video job to wait for
+        poll_interval: Seconds to wait between retrievals
+        timeout: Seconds to wait in total before giving up, or `None` to wait forever
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments passed to each retrieval
+
+    Returns:
+        The finished video job. A `failed` job is returned, not raised, so its `error` can be read.
+
+    Raises:
+        TimeoutError: If the job is still running after `timeout` seconds.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return await llm.apoll_video(video_id, poll_interval=poll_interval, timeout=timeout, **kwargs)
+
+
+def download_video(
+    provider: str | LLMProvider,
+    output: VideoOutput,
+    *,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> bytes:
+    """Download a generated video.
+
+    Args:
+        provider: Provider that generated the video (e.g., 'together')
+        output: One entry of `VideoJob.outputs`
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments
+
+    Returns:
+        The video file, usually MP4.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return llm.download_video(output, **kwargs)
+
+
+async def adownload_video(
+    provider: str | LLMProvider,
+    output: VideoOutput,
+    *,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    client_args: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> bytes:
+    """Download a generated video asynchronously.
+
+    Args:
+        provider: Provider that generated the video (e.g., 'together')
+        output: One entry of `VideoJob.outputs`
+        api_key: API key for the provider
+        api_base: Base URL for the provider API
+        client_args: Additional provider-specific arguments for client instantiation
+        **kwargs: Additional provider-specific arguments
+
+    Returns:
+        The video file, usually MP4.
+
+    """
+    llm = AnyLLM.create(AnyLLM.resolve_provider_key(provider), api_key=api_key, api_base=api_base, **client_args or {})
+    return await llm.adownload_video(output, **kwargs)

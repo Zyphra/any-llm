@@ -166,3 +166,138 @@ def test_convert_chunk_response_with_nonstandard_service_tier() -> None:
     )
     result = BaseOpenAIProvider._convert_completion_chunk_response(openai_chunk)
     assert result.service_tier == "standard"
+
+
+def test_convert_completion_response_keeps_nonstandard_finish_reason() -> None:
+    """A finish_reason outside OpenAI's five values must not lose the whole response."""
+    openai_response = OpenAIChatCompletion.model_construct(
+        id="test-id",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "some_new_reason",
+                "message": {"role": "assistant", "content": "Hello"},
+            }
+        ],
+        created=1234567890,
+        model="test-model",
+        object="chat.completion",
+    )
+    result = _convert_chat_completion(openai_response)
+    assert result.choices[0].finish_reason == "some_new_reason"
+    assert result.choices[0].message.content == "Hello"
+
+
+def test_convert_chunk_response_keeps_nonstandard_finish_reason() -> None:
+    """Streaming must keep a finish_reason outside OpenAI's five values too."""
+    openai_chunk = OpenAIChatCompletionChunk.model_construct(
+        id="test-id",
+        choices=[{"index": 0, "delta": {"content": "Hi"}, "finish_reason": "some_new_reason"}],
+        created=1234567890,
+        model="test-model",
+        object="chat.completion.chunk",
+    )
+    result = BaseOpenAIProvider._convert_completion_chunk_response(openai_chunk)
+    assert result.choices[0].finish_reason == "some_new_reason"
+
+
+def _vertex_partner_chunk(usage: dict[str, object]) -> OpenAIChatCompletionChunk:
+    return OpenAIChatCompletionChunk.model_construct(
+        id="test-id",
+        choices=[{"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": None}],
+        created=1234567890,
+        model="qwen/qwen3-235b-a22b-instruct-2507-maas",
+        object="chat.completion.chunk",
+        usage=usage,
+    )
+
+
+def test_convert_chunk_response_drops_usage_without_token_counts() -> None:
+    """Vertex AI's OpenAI-compatible stream sends usage with only extra_properties on every chunk."""
+    chunk = _vertex_partner_chunk({"extra_properties": {"google": {"traffic_type": "ON_DEMAND"}}})
+
+    result = BaseOpenAIProvider._convert_completion_chunk_response(chunk)
+
+    assert result.usage is None
+    assert result.choices[0].delta.content == "OK"
+
+
+def test_convert_chunk_response_keeps_usage_with_token_counts() -> None:
+    """The last chunk's counts survive, next to the provider's extra_properties."""
+    chunk = _vertex_partner_chunk(
+        {
+            "prompt_tokens": 11,
+            "completion_tokens": 2,
+            "total_tokens": 13,
+            "prompt_tokens_details": {"cached_tokens": 3},
+            "extra_properties": {"google": {"traffic_type": "ON_DEMAND"}},
+        }
+    )
+
+    result = BaseOpenAIProvider._convert_completion_chunk_response(chunk)
+
+    assert result.usage is not None
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (11, 2, 13)
+
+
+@pytest.mark.parametrize(
+    "audio_piece",
+    [
+        {"id": "audio_6a98e62e", "transcript": "Sure"},
+        {"data": "AAAB//8CAP=="},
+        {"expires_at": 1788408898},
+    ],
+)
+def test_convert_chunk_response_keeps_partial_audio_delta(audio_piece: dict[str, object]) -> None:
+    """OpenAI streams delta audio fields in separate chunks."""
+    openai_chunk = OpenAIChatCompletionChunk.model_validate(
+        {
+            "id": "chatcmpl-audio",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-audio-mini",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "audio": audio_piece}, "finish_reason": None}],
+        }
+    )
+
+    result = BaseOpenAIProvider._convert_completion_chunk_response(openai_chunk)
+
+    audio = result.choices[0].delta.audio
+    assert audio is not None
+    assert audio.model_dump(exclude_none=True) == audio_piece
+
+
+def test_convert_chat_completion_keeps_only_string_metadata() -> None:
+    """A non-string metadata value, as Nebius sends for DeepSeek V4.1, is dropped rather than failing the response."""
+    openai_response = OpenAIChatCompletion.construct(
+        id="chatcmpl-nebius",
+        object="chat.completion",
+        created=0,
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        choices=[{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Hello"}}],
+        metadata={"weight_versions": [{"version": "default", "start": 0, "end": 57}], "region": "eu-north1"},
+    )
+
+    result = _convert_chat_completion(openai_response)
+
+    assert result.metadata == {"region": "eu-north1"}
+    assert result.choices[0].message.content == "Hello"
+
+
+def test_convert_parsed_chat_completion_keeps_only_string_metadata() -> None:
+    raw = OpenAIChatCompletion.construct(
+        id="chatcmpl-nebius",
+        object="chat.completion",
+        created=0,
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        choices=[
+            {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": '{"answer":"Earth"}'}}
+        ],
+        metadata={"weight_versions": [{"version": "default", "start": 0, "end": 57}]},
+    )
+    parsed = parse_chat_completion(response_format=Answer, input_tools=[], chat_completion=raw)
+
+    converted = _convert_parsed_chat_completion(parsed)
+
+    assert converted.metadata == {}
+    assert converted.choices[0].message.parsed == Answer(answer="Earth")

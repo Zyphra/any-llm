@@ -26,7 +26,6 @@ from any_llm.types.completion import (
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
     ChunkChoice,
-    CompletionUsage,
     CreateEmbeddingResponse,
     Embedding,
     Function,
@@ -35,6 +34,7 @@ from any_llm.types.completion import (
 )
 from any_llm.types.model import Model
 from any_llm.types.moderation import ModerationResponse, ModerationResult
+from any_llm.utils.usage import completion_usage_from_dict
 
 DEFAULT_TIMEOUT_HOURS = 24
 DEFAULT_COMPLETION_WINDOW = f"{DEFAULT_TIMEOUT_HOURS}h"
@@ -42,6 +42,11 @@ DEFAULT_COMPLETION_WINDOW = f"{DEFAULT_TIMEOUT_HOURS}h"
 if TYPE_CHECKING:
     from mistralai.client.models import BatchJob, ListBatchJobsResponse
     from mistralai.client.models.embeddingresponse import EmbeddingResponse
+
+
+# Mistral's non-streaming model_length means generation stopped at the model's context
+# window, which is a truncation like OpenAI's length.
+_MISTRAL_FINISH_REASON_MAP = {"model_length": "length"}
 
 
 def _convert_mistral_tool_calls_to_any_llm(
@@ -248,21 +253,14 @@ def _create_mistral_completion_from_response(
 
         choice = Choice(
             index=i,
-            finish_reason=cast(
-                "Literal['stop', 'length', 'tool_calls', 'content_filter', 'function_call']",
-                choice_data.finish_reason,
-            ),
+            finish_reason=_MISTRAL_FINISH_REASON_MAP.get(choice_data.finish_reason, choice_data.finish_reason),
             message=message,
         )
         choices_out.append(choice)
 
     usage = None
     if response_data.usage:
-        usage = CompletionUsage(
-            completion_tokens=response_data.usage.completion_tokens or 0,
-            prompt_tokens=response_data.usage.prompt_tokens or 0,
-            total_tokens=response_data.usage.total_tokens or 0,
-        )
+        usage = completion_usage_from_dict(response_data.usage.model_dump())
 
     return ChatCompletion(
         id=response_data.id,
@@ -338,17 +336,13 @@ def _create_openai_chunk_from_mistral_chunk(event: CompletionEvent) -> ChatCompl
         openai_choice = ChunkChoice(
             index=choice.index,
             delta=delta,
-            finish_reason=choice.finish_reason,  # type: ignore[arg-type]
+            finish_reason=choice.finish_reason,
         )
         openai_choices.append(openai_choice)
 
     usage = None
     if chunk.usage:
-        usage = CompletionUsage(
-            prompt_tokens=chunk.usage.prompt_tokens or 0,
-            completion_tokens=chunk.usage.completion_tokens or 0,
-            total_tokens=chunk.usage.total_tokens or 0,
-        )
+        usage = completion_usage_from_dict(chunk.usage.model_dump())
 
     return ChatCompletionChunk(
         id=chunk.id,
@@ -505,14 +499,36 @@ def _build_mistral_assistant_content(message: dict[str, Any]) -> list[dict[str, 
     return chunks
 
 
+def _is_empty_assistant_content(content: Any) -> bool:
+    """Whether assistant content is absent, an empty string, or only empty text parts."""
+    if content is None or content == "":
+        return True
+    if isinstance(content, list):
+        return all(isinstance(part, dict) and part.get("type") == "text" and not part.get("text") for part in content)
+    return False
+
+
+def _is_empty_assistant_message(message: dict[str, Any]) -> bool:
+    """Whether a message is an assistant turn with no content, tool calls, or reasoning to replay."""
+    return (
+        message.get("role") == "assistant"
+        and _is_empty_assistant_content(message.get("content"))
+        and not message.get("tool_calls")
+        and not _extract_reasoning_text(message)
+    )
+
+
 def _patch_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Patches messages for Mistral API compatibility.
 
+    - Drops assistant messages that carry nothing, since Mistral rejects an empty assistant
+      content and, when such a message ends the conversation, also rejects it as the last role.
     - Rebuilds assistant thinking blocks so reasoning traces survive multi-turn replay.
     - Inserts an assistant message with "OK" content between a tool message and a user message.
     - Validates the message sequence to ensure correctness.
     """
+    messages = [msg for msg in messages if not _is_empty_assistant_message(msg)]
     processed_msg: list[dict[str, Any]] = []
     for i, msg in enumerate(messages):
         if msg.get("role") == "assistant":

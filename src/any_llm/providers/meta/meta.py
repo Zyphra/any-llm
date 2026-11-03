@@ -8,14 +8,11 @@ from typing_extensions import override
 
 from any_llm.exceptions import UnsupportedParameterError
 from any_llm.providers.openai.base import BaseOpenAIProvider
-from any_llm.types.messages import (
-    ContentBlockDeltaEvent,
-    ContentBlockStartEvent,
-    ContentBlockStopEvent,
-    MessageDeltaEvent,
-    MessageResponse,
-    MessageStartEvent,
-    MessageStopEvent,
+from any_llm.types.messages import MessageResponse
+from any_llm.utils.messages_compat import (
+    anthropic_client_kwargs,
+    prepare_blocks_for_native_messages,
+    stream_native_messages,
 )
 from any_llm.utils.structured_output import is_structured_output_type
 
@@ -27,22 +24,11 @@ if TYPE_CHECKING:
 
     from any_llm.types.messages import MessagesParams, MessageStreamEvent
 
-# Meta's /v1/messages stream yields typed anthropic SDK events (unlike gateways that hand
-# back raw dicts), so events are validated straight into any-llm's typed models by `type`.
-_MESSAGE_STREAM_EVENT_TYPES: dict[str, type[Any]] = {
-    "message_start": MessageStartEvent,
-    "message_delta": MessageDeltaEvent,
-    "message_stop": MessageStopEvent,
-    "content_block_start": ContentBlockStartEvent,
-    "content_block_delta": ContentBlockDeltaEvent,
-    "content_block_stop": ContentBlockStopEvent,
-}
-
 # Meta's Messages docs state these return HTTP 400 (`stop_sequences`, `top_k`) or are simply
-# not part of its documented request shape (`prompt_cache_key`, which Meta documents only for
-# Chat Completions/Responses, not Messages). Reject them client-side with a clear error instead
-# of letting the SDK or the API surface an opaque 400/TypeError.
-_MESSAGES_UNSUPPORTED_PARAMS = ("prompt_cache_key", "stop_sequences", "top_k")
+# not part of its documented request shape (`container`, plus `prompt_cache_key`, which Meta
+# documents only for Chat Completions/Responses). Reject them client-side with a clear error
+# instead of letting the SDK or the API surface an opaque 400/TypeError.
+_MESSAGES_UNSUPPORTED_PARAMS = ("container", "prompt_cache_key", "stop_sequences", "top_k")
 
 
 def _derive_anthropic_base(openai_base: str) -> str:
@@ -65,8 +51,8 @@ class MetaProvider(BaseOpenAIProvider):
     any-llm's default Messages<->Completions bridge, so that `thinking` blocks and native
     `tool_use` blocks survive the round trip (a bridged conversion would drop both). Meta's
     Messages endpoint documents a narrower field set than genuine Anthropic, though: fields
-    it explicitly 400s on or doesn't document at all (`prompt_cache_key`, `stop_sequences`,
-    `top_k`) are rejected client-side rather than forwarded, see `_amessages`.
+    it explicitly 400s on or doesn't document at all (`container`, `prompt_cache_key`,
+    `stop_sequences`, `top_k`) are rejected client-side rather than forwarded, see `_amessages`.
     """
 
     PROVIDER_NAME = "meta"
@@ -94,6 +80,7 @@ class MetaProvider(BaseOpenAIProvider):
     SUPPORTS_BATCH = False
     SUPPORTS_IMAGE_GENERATION = False
     SUPPORTS_RERANK = False
+    SUPPORTS_MESSAGES_NATIVE = True
 
     client: AsyncOpenAI
     _anthropic_client: AsyncAnthropic
@@ -107,7 +94,7 @@ class MetaProvider(BaseOpenAIProvider):
         self._anthropic_client = AsyncAnthropic(
             auth_token=api_key,
             base_url=_derive_anthropic_base(resolved_base),
-            **kwargs,
+            **anthropic_client_kwargs(kwargs),
         )
 
     @override
@@ -118,11 +105,10 @@ class MetaProvider(BaseOpenAIProvider):
 
         Meta's translation layer does not document support for Anthropic's context
         management or beta primitives, so those are rejected rather than silently dropped.
-        Likewise `prompt_cache_key` (documented only for Chat Completions/Responses) and
-        `stop_sequences`/`top_k` (documented to 400 on Messages) are rejected client-side
-        instead of being forwarded to the Anthropic SDK, which would either reject them with
-        a raw `TypeError` (`prompt_cache_key` isn't part of its `messages.create` signature)
-        or a less legible API-side 400.
+        Likewise `container` (not documented for Meta Messages), `prompt_cache_key`
+        (documented only for Chat Completions/Responses), and `stop_sequences`/`top_k`
+        (documented to 400 on Messages) are rejected client-side instead of being forwarded
+        to the Anthropic SDK or the Meta endpoint.
         """
         if params.context_management is not None or params.betas:
             msg = "context_management and betas are not supported by the Meta Messages API"
@@ -134,14 +120,14 @@ class MetaProvider(BaseOpenAIProvider):
 
         if params.output_format is not None:
             if params.stream:
-                # Belt-and-suspenders: the public `amessages()` entry point already rejects this
-                # combination before params reach here, but `_amessages` can be called directly
-                # (e.g. in tests), so guard here too rather than silently dropping `stream`.
+                # The native path below makes non-streaming calls only, so refuse rather than
+                # silently dropping `stream`.
                 msg = "stream is not supported for output_format"
                 raise ValueError(msg)
             native_kwargs = params.model_dump(
                 exclude_none=True, exclude={"output_format", "stream", "betas", "context_management"}
             )
+            native_kwargs["messages"] = prepare_blocks_for_native_messages(native_kwargs["messages"])
             native_kwargs.update(kwargs)
             if is_structured_output_type(params.output_format):
                 return await self._anthropic_client.messages.parse(output_format=params.output_format, **native_kwargs)
@@ -152,6 +138,7 @@ class MetaProvider(BaseOpenAIProvider):
 
         api_kwargs = params.model_dump(exclude_none=True, exclude={"betas", "context_management"})
         api_kwargs.pop("stream", None)
+        api_kwargs["messages"] = prepare_blocks_for_native_messages(api_kwargs["messages"])
         api_kwargs.update(kwargs)
 
         if params.stream:
@@ -160,13 +147,9 @@ class MetaProvider(BaseOpenAIProvider):
         message = await self._anthropic_client.messages.create(**api_kwargs)
         return self._convert_native_message_to_response(message)
 
-    async def _stream_messages_async(self, **kwargs: Any) -> AsyncIterator[MessageStreamEvent]:
+    def _stream_messages_async(self, **kwargs: Any) -> AsyncIterator[MessageStreamEvent]:
         """Stream Meta's native /v1/messages endpoint, yielding typed any-llm event models."""
-        async with self._anthropic_client.messages.stream(**kwargs) as stream:
-            async for event in stream:
-                event_model = _MESSAGE_STREAM_EVENT_TYPES.get(event.type)
-                if event_model is not None:
-                    yield event_model.model_validate(event, from_attributes=True)
+        return stream_native_messages(self._anthropic_client, **kwargs)
 
     @staticmethod
     def _convert_native_message_to_response(message: Any) -> MessageResponse:

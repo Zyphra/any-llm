@@ -44,7 +44,7 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         # with reasoning_effort set: OpenAI reasoning_effort is not mapped to Anthropic extended
         # thinking). gpt-oss-120b does emit reasoning, which needs the otari SDK reasoning-string
         # fix (mozilla-ai/otari#145) to deserialize.
-        LLMProvider.OTARI: "mzai:openai/gpt-oss-120b",
+        LLMProvider.OTARI: "nebius:openai/gpt-oss-120b",
         LLMProvider.VERTEXAI: "gemini-2.5-flash",
         LLMProvider.GITHUB: "openai/gpt-4.1-nano",
         LLMProvider.GROQ: "openai/gpt-oss-20b",
@@ -64,14 +64,15 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.CASCADIA: "N/A",
         LLMProvider.ATLASCLOUD: "deepseek-ai/deepseek-v4-flash",
         LLMProvider.KENARI: "deepseek-v4-flash",
-        LLMProvider.LMSTUDIO: "qwen3-0.6b",
+        # CI downloads and loads only the LMSTUDIO_MODEL in tests-integration.yaml.
+        LLMProvider.LMSTUDIO: "qwen/qwen3-1.7b",
         LLMProvider.AZUREOPENAI: "gpt-4.1-nano",
         LLMProvider.CEREBRAS: "gpt-oss-120b",
         LLMProvider.COHERE: "command-a-reasoning-08-2025",
-        # deepseek-reasoner is discontinued 2026-07-24 in favor of deepseek-v4-flash, where
+        # deepseek-reasoner is discontinued 2026-07-24 in favor of the Flash model, where
         # thinking mode is now a request-level toggle (see DeepseekProvider._convert_completion_params)
-        # rather than a dedicated model name.
-        LLMProvider.DEEPSEEK: "deepseek-v4-flash",
+        # rather than a dedicated model name. deepseek-v4-flash is a legacy alias of deepseek-flash.
+        LLMProvider.DEEPSEEK: "deepseek-flash",
         # kimi-k2-thinking and kimi-thinking-preview are discontinued; kimi-k2.6 is the
         # current reasoning-capable model (thinking mode, native multimodal).
         LLMProvider.MOONSHOT: "kimi-k2.6",
@@ -80,8 +81,11 @@ def provider_reasoning_model_map() -> dict[LLMProvider, str]:
         LLMProvider.NEOSANTARA: "deepseek-v4-flash",
         LLMProvider.NEBIUS: "openai/gpt-oss-120b",
         LLMProvider.SAMBANOVA: "gpt-oss-120b",
-        LLMProvider.TOGETHER: "openai/gpt-oss-20b",
-        LLMProvider.PORTKEY: "@nebius-any-llm/Qwen/Qwen3-32B",
+        # Together removed gpt-oss-20b from serverless on 2026-09-15 (400 "Unable to access
+        # non-serverless model"); the 120b sibling stays serverless and reports reasoning in the
+        # `reasoning` field TogetherProvider reads, including while streaming.
+        LLMProvider.TOGETHER: "openai/gpt-oss-120b",
+        LLMProvider.PORTKEY: "@nebius-any-llm/Qwen/Qwen3.5-397B-A17B",
         LLMProvider.MINIMAX: "MiniMax-M2",
         LLMProvider.ZAI: "glm-4.5-flash",
         LLMProvider.DEEPINFRA: "deepseek-ai/DeepSeek-R1",
@@ -95,10 +99,11 @@ def provider_model_map() -> dict[LLMProvider, str]:
     return {
         LLMProvider.MISTRAL: "mistral-small-latest",
         LLMProvider.ANTHROPIC: "claude-haiku-4-5",
-        # deepseek-chat is discontinued 2026-07-24 in favor of deepseek-v4-flash; thinking mode
+        # deepseek-chat is discontinued 2026-07-24 in favor of the Flash model; thinking mode
         # defaults to disabled for it unless reasoning_effort is set (see
         # DeepseekProvider._convert_completion_params), matching the old deepseek-chat behavior.
-        LLMProvider.DEEPSEEK: "deepseek-v4-flash",
+        # deepseek-v4-flash is a legacy alias of deepseek-flash.
+        LLMProvider.DEEPSEEK: "deepseek-flash",
         LLMProvider.OPENAI: "gpt-5-nano",
         # otari routes provider:model; anthropic is the only upstream the test account serves reliably.
         LLMProvider.OTARI: "anthropic:claude-haiku-4-5",
@@ -106,9 +111,9 @@ def provider_model_map() -> dict[LLMProvider, str]:
         LLMProvider.GMI: "zai-org/GLM-5-FP8",
         LLMProvider.GITHUB: "openai/gpt-4.1-nano",
         LLMProvider.VERTEXAI: "gemini-3-flash-preview",
-        LLMProvider.MOONSHOT: "kimi-k2.6",
+        LLMProvider.MOONSHOT: "kimi-k3",
         LLMProvider.SAMBANOVA: "gpt-oss-120b",
-        LLMProvider.TOGETHER: "openai/gpt-oss-20b",
+        LLMProvider.TOGETHER: "Qwen/Qwen3.5-9B",
         LLMProvider.XAI: "grok-3-mini-latest",
         LLMProvider.INCEPTION: "mercury",
         LLMProvider.NEOSANTARA: "gemini-3-flash-preview",
@@ -150,12 +155,12 @@ def provider_image_model_map(provider_model_map: dict[LLMProvider, str]) -> dict
         LLMProvider.OPENAI: "gpt-5-mini",  # Slightly more powerful so that it doesn't get caught in a loop of logic
         LLMProvider.WATSONX: "meta-llama/llama-guard-3-11b-vision",
         LLMProvider.SAMBANOVA: "gemma-4-31B-it",
-        LLMProvider.NEBIUS: "Qwen/Qwen2.5-VL-72B-Instruct",
+        LLMProvider.NEBIUS: "google/gemma-3-27b-it",
         LLMProvider.OPENROUTER: "google/gemini-2.5-flash-lite",
         LLMProvider.COHERE: "command-a-vision-07-2025",  # command-a-03-2025 rejects image content
         LLMProvider.OLLAMA: "llava-phi3",  # Fast vision model compatible with OpenAI format
-        LLMProvider.FIREWORKS: "accounts/fireworks/models/kimi-k2p6",
-        LLMProvider.BEDROCK: "anthropic.claude-3-haiku-20240307-v1:0",  # Claude 3 Haiku with vision support
+        LLMProvider.FIREWORKS: "accounts/fireworks/models/kimi-k3",
+        LLMProvider.BEDROCK: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         LLMProvider.NEOSANTARA: "gemini-3-flash-preview",  # Vision model compatible with OpenAI format
     }
 
@@ -192,6 +197,40 @@ def embedding_provider_model_map() -> dict[LLMProvider, str]:
 
 
 @pytest.fixture
+def rerank_provider_model_map() -> dict[LLMProvider, str]:
+    return {
+        LLMProvider.COHERE: "rerank-v3.5",
+        LLMProvider.FIREWORKS: "accounts/fireworks/models/qwen3-reranker-8b",
+        # rerank-3/rerank-3-lite are still in preview; 2.5-lite is the current GA latency model.
+        LLMProvider.VOYAGE: "rerank-2.5-lite",
+        # together intentionally omitted: Together serves no rerank model on its serverless tier
+        # (https://docs.together.ai/docs/serverless-models), so there is no model a plain
+        # TOGETHER_API_KEY can reach. See RERANK_INFRA_NOT_CONFIGURED_IN_CI in
+        # tests/integration/test_rerank.py.
+        # otari intentionally omitted: the test account routes only Anthropic upstreams, which
+        # have no rerank endpoint, so test_rerank skips otari.
+    }
+
+
+@pytest.fixture
+def decide_provider_model_map() -> dict[LLMProvider, str]:
+    return {
+        # llama-server ignores the model when it serves one model.
+        LLMProvider.LLAMACPP: "N/A",
+        LLMProvider.OPENROUTER: "typesafe/jev-1.13",
+        LLMProvider.TYPESAFE: "jev-latest",
+    }
+
+
+@pytest.fixture
+def video_provider_model_map() -> dict[LLMProvider, str]:
+    return {
+        LLMProvider.GEMINI: "gemini-omni-1.1-flash",
+        LLMProvider.TOGETHER: "ByteDance/Seedance-2.0",
+    }
+
+
+@pytest.fixture
 def provider_client_config() -> dict[LLMProvider, dict[str, Any]]:
     return {
         LLMProvider.ANTHROPIC: {"timeout": 10},
@@ -221,7 +260,7 @@ def provider_client_config() -> dict[LLMProvider, dict[str, Any]]:
         LLMProvider.XAI: {"timeout": 100},
         LLMProvider.AZUREOPENAI: {
             "api_base": "https://mlrun-me8bof5t-eastus2.cognitiveservices.azure.com/",
-            "api_version": "2025-03-01-preview",
+            "api_version": "v1",
         },
     }
 

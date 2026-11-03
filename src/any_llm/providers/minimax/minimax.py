@@ -1,5 +1,4 @@
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import aclosing
+from collections.abc import AsyncIterator
 from typing import Any
 
 from openai._streaming import AsyncStream
@@ -11,6 +10,7 @@ from any_llm.exceptions import UnsupportedParameterError
 from any_llm.providers.openai.xml_reasoning import XMLReasoningOpenAIProvider, wrap_chunks_with_xml_reasoning
 from any_llm.providers.openai.xml_reasoning_utils import convert_chat_completion_with_xml_reasoning
 from any_llm.types.completion import ChatCompletion, ChatCompletionChunk, CompletionParams
+from any_llm.utils.aio import aclose_quietly
 
 
 class MinimaxProvider(XMLReasoningOpenAIProvider):
@@ -37,18 +37,14 @@ class MinimaxProvider(XMLReasoningOpenAIProvider):
 
     @override
     def _convert_completion_response_async(
-        self,
-        response: OpenAIChatCompletion
-        | AsyncStream[OpenAIChatCompletionChunk]
-        | AsyncGenerator[OpenAIChatCompletionChunk, None],
+        self, response: OpenAIChatCompletion | AsyncStream[OpenAIChatCompletionChunk]
     ) -> ChatCompletion | AsyncIterator[ChatCompletionChunk]:
         """Convert completion response with Minimax-specific chunk filtering."""
         if isinstance(response, OpenAIChatCompletion):
             return self._convert_completion_response(response)
 
         async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            stream_context = response if isinstance(response, AsyncStream) else aclosing(response)
-            async with stream_context:
+            try:
                 async for chunk in response:
                     if not isinstance(chunk, OpenAIChatCompletionChunk):
                         continue
@@ -58,6 +54,8 @@ class MinimaxProvider(XMLReasoningOpenAIProvider):
                         # Minimax can attach usage to a terminal chunk whose choice carries no delta,
                         # which fails chunk validation. Keep the usage and drop the unusable choices.
                         yield self._convert_completion_chunk_response(chunk.model_copy(update={"choices": []}))
+            finally:
+                await aclose_quietly(response)
 
         return wrap_chunks_with_xml_reasoning(chunk_iterator())
 

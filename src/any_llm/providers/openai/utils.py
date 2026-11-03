@@ -31,6 +31,9 @@ def _normalize_reasoning_on_message(message_dict: dict[str, Any]) -> None:
         message_dict["reasoning"] = {"content": str(value)}
 
 
+_USAGE_TOKEN_COUNTS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
 def _normalize_openai_dict_response(response_dict: dict[str, Any]) -> dict[str, Any]:
     """Return a dict where non-standard reasoning fields are normalized.
 
@@ -47,6 +50,12 @@ def _normalize_openai_dict_response(response_dict: dict[str, Any]) -> dict[str, 
             delta = choice.get("delta") if isinstance(choice, dict) else None
             if isinstance(delta, dict):
                 _normalize_reasoning_on_message(delta)
+
+    # Vertex AI's OpenAI-compatible endpoint puts a usage object on every stream chunk, holding only
+    # extra_properties until the last one has the counts. A usage with no token counts at all is none.
+    usage = response_dict.get("usage")
+    if isinstance(usage, dict) and all(usage.get(key) is None for key in _USAGE_TOKEN_COUNTS):
+        response_dict["usage"] = None
 
     return response_dict
 
@@ -80,6 +89,11 @@ def _convert_chat_completion(response: OpenAIChatCompletion) -> ChatCompletion:
         )
         response.created = int(response.created)
     normalized = _normalize_openai_dict_response(response.model_dump(warnings=False))
+    # OpenAI types metadata as string pairs, but some servers put other values there (Nebius
+    # serving DeepSeek V4.1 sends a weight_versions list), which would fail the whole response.
+    metadata = normalized.get("metadata")
+    if isinstance(metadata, dict):
+        normalized["metadata"] = {key: value for key, value in metadata.items() if isinstance(value, str)}
     return ChatCompletion.model_validate(normalized)
 
 

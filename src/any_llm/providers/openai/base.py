@@ -1,9 +1,9 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from openai import AsyncOpenAI
 from openai._streaming import AsyncStream
@@ -16,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from typing_extensions import override
 
 from any_llm.any_llm import AnyLLM
-from any_llm.exceptions import BatchNotCompleteError
+from any_llm.exceptions import BatchNotCompleteError, ProviderError, UnsupportedParameterError
 from any_llm.logging import logger
 from any_llm.providers.openai.utils import (
     _convert_chat_completion,
@@ -33,15 +33,74 @@ from any_llm.types.completion import (
     CreateEmbeddingResponse,
     ReasoningEffort,
 )
-from any_llm.types.image import ImageGenerationParams, ImagesResponse
+from any_llm.types.decide import DecideResponse, JSONContent, Question
+from any_llm.types.image import ImageEditParams, ImageGenerationParams, ImagesResponse
+from any_llm.types.messages import (
+    MessageResponse,
+    MessagesParams,
+    MessageStreamEvent,
+    ParsedBetaMessage,
+    ParsedMessage,
+)
 from any_llm.types.model import Model
 from any_llm.types.moderation import ModerationResponse
 from any_llm.types.responses import ParsedResponse, Response, ResponsesParams, ResponseStreamEvent
+from any_llm.utils.aio import aclose_quietly
+from any_llm.utils.decide import question_to_dict
+from any_llm.utils.reasoning import strip_extra_content
 from any_llm.utils.structured_output import (
     build_responses_text_format,
     get_json_schema,
     is_structured_output_type,
 )
+
+from .messages_responses import (
+    convert_responses_stream,
+    messages_needs_responses,
+    messages_params_to_responses_params,
+    response_to_message_response,
+)
+
+if TYPE_CHECKING:
+    from openai._types import RequestOptions
+
+
+class OpenAIChunkStream(AsyncIterator[ChatCompletionChunk]):
+    """Convert an OpenAI SDK chunk stream and close it on every exit.
+
+    A generator over ``response`` cannot release the HTTP response when it is closed before its
+    first read, since ``aclose()`` never enters its body. This iterator holds the SDK stream
+    directly, so ``aclose()`` reaches it whether or not anything was read.
+    """
+
+    def __init__(
+        self,
+        response: AsyncStream[OpenAIChatCompletionChunk],
+        convert: Callable[[OpenAIChatCompletionChunk], ChatCompletionChunk],
+    ) -> None:
+        self._response = response
+        self._iterator = aiter(response)
+        self._convert = convert
+        self._closed = False
+
+    @override
+    def __aiter__(self) -> "OpenAIChunkStream":
+        return self
+
+    @override
+    async def __anext__(self) -> ChatCompletionChunk:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return self._convert(await anext(self._iterator))
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await aclose_quietly(self._response)
 
 
 class BaseOpenAIProvider(AnyLLM):
@@ -55,6 +114,7 @@ class BaseOpenAIProvider(AnyLLM):
 
     SUPPORTS_COMPLETION_STREAMING = True
     SUPPORTS_COMPLETION = True
+    SUPPORTS_COMPLETION_N = True
     SUPPORTS_RESPONSES = False
     SUPPORTS_COMPLETION_REASONING = False
     SUPPORTS_COMPLETION_IMAGE = True
@@ -66,10 +126,23 @@ class BaseOpenAIProvider(AnyLLM):
     SUPPORTS_IMAGE_GENERATION = False
     SUPPORTS_RERANK = False
 
+    DECIDE_PATH: ClassVar[str | None] = None
+    """Path of the System One decisions endpoint, relative to the API base, for a provider that
+    sets ``SUPPORTS_DECIDE``. It is resolved like a link, so ``../`` leaves the API version."""
+
     # The OpenAI SDK accepts a per-request `timeout` on its client calls, so it forwards unchanged.
     TIMEOUT_SUPPORT = "native"
 
+    # OpenAI's Chat Completions rejects function tools with a reasoning effort on newer
+    # reasoning models, so those Messages requests go to Responses instead. Off by default:
+    # other OpenAI-compatible backends accept the combination on Chat Completions, and their
+    # Responses endpoints differ in which tool and reasoning fields they support.
+    _MESSAGES_TOOLS_THINKING_VIA_RESPONSES = False
+    MAX_RETRIES_SUPPORT: Literal["unsupported", "native", "mapped"] = "native"
+
     _DEFAULT_REASONING_EFFORT: ReasoningEffort | None = None
+    _NORMALIZES_RESPONSES: ClassVar[bool] = True
+    """Whether a Responses reply is converted to an OpenResponses ``ResponseResource``."""
 
     client: AsyncOpenAI
 
@@ -190,12 +263,7 @@ class BaseOpenAIProvider(AnyLLM):
         if isinstance(response, OpenAIChatCompletion):
             return self._convert_completion_response(response)
 
-        async def chunk_iterator() -> AsyncIterator[ChatCompletionChunk]:
-            async with response:
-                async for chunk in response:
-                    yield self._convert_completion_chunk_response(chunk)
-
-        return chunk_iterator()
+        return OpenAIChunkStream(response, self._convert_completion_chunk_response)
 
     @override
     async def _acompletion(
@@ -203,6 +271,8 @@ class BaseOpenAIProvider(AnyLLM):
     ) -> ChatCompletion | AsyncIterator[ChatCompletionChunk]:
         if params.reasoning_effort == "auto":
             params.reasoning_effort = self._DEFAULT_REASONING_EFFORT
+        # An OpenAI-compatible base URL may be Gemini's, which needs its thought signatures back.
+        params.messages = strip_extra_content(params.messages, keep_namespaces=("google",))
 
         completion_kwargs = self._convert_completion_params(params, **kwargs)
 
@@ -259,8 +329,8 @@ class BaseOpenAIProvider(AnyLLM):
         # layer can parse it into a ParsedResponse (do not collapse it to a ResponseResource).
         if is_structured_output_type(response_format):
             return response
-        # if it's a Response, try to convert it to a ResponseResource. If that fails, return the Response
-        if isinstance(response, Response):
+        # Normalizing providers convert a Response to a ResponseResource, falling back to the Response if that fails.
+        if isinstance(response, Response) and self._NORMALIZES_RESPONSES:
             try:
                 return ResponseResource.model_validate(response.model_dump(warnings=False))
             except ValidationError as e:
@@ -270,6 +340,38 @@ class BaseOpenAIProvider(AnyLLM):
                 logger.info(msg)
                 return response
         return response
+
+    @override
+    async def _amessages(
+        self, params: MessagesParams, **kwargs: Any
+    ) -> MessageResponse | ParsedMessage[Any] | ParsedBetaMessage[Any] | AsyncIterator[MessageStreamEvent]:
+        """Serve Messages requests with tools and enabled thinking through Responses when opted in."""
+        if not (self._MESSAGES_TOOLS_THINKING_VIA_RESPONSES and messages_needs_responses(params)):
+            return await super()._amessages(params, **kwargs)
+
+        if params.container is not None:
+            msg = "container requires a provider with a native Anthropic Messages API"
+            raise NotImplementedError(msg)
+        if params.context_management is not None or params.betas:
+            msg = "context_management and betas require a provider with a native Anthropic Messages API"
+            raise NotImplementedError(msg)
+        if params.stop_sequences:
+            # The Completions bridge maps these to ``stop``; Responses has no equivalent, and
+            # dropping them would change the output without telling the caller.
+            param = "stop_sequences"
+            msg = (
+                "Messages requests with tools and enabled thinking are served by the Responses API, "
+                "which has no stop parameter."
+            )
+            raise UnsupportedParameterError(param, self.PROVIDER_NAME, msg)
+
+        responses_params = messages_params_to_responses_params(params)
+        result = await self._aresponses(responses_params, **kwargs)
+
+        if isinstance(result, (Response, ResponseResource)):
+            return response_to_message_response(result)
+
+        return convert_responses_stream(result)
 
     @override
     async def _aembedding(
@@ -307,15 +409,30 @@ class BaseOpenAIProvider(AnyLLM):
         )
 
     @override
+    async def _aimage_edit(self, params: ImageEditParams, **kwargs: Any) -> ImagesResponse:
+        api_kwargs = params.to_api_kwargs()
+        api_kwargs.update(kwargs)
+
+        return await self.client.images.edit(  # type: ignore[no-any-return]
+            model=params.model_id,
+            image=params.resolve_images(),
+            **api_kwargs,
+        )
+
+    @override
     async def _atranscription(self, params: AudioTranscriptionParams, **kwargs: Any) -> Transcription:
         api_kwargs = params.to_api_kwargs()
         api_kwargs.update(kwargs)
 
-        return await self.client.audio.transcriptions.create(  # type: ignore[no-any-return]
+        result = await self.client.audio.transcriptions.create(
             model=params.model_id,
-            file=params.file,
+            file=params.resolve_file().multipart,
             **api_kwargs,
         )
+        # The SDK returns the raw body for the text, srt and vtt formats.
+        if isinstance(result, str):
+            return Transcription(text=result)
+        return result  # type: ignore[no-any-return]
 
     @override
     async def _aspeech(self, params: AudioSpeechParams, **kwargs: Any) -> bytes:
@@ -350,6 +467,41 @@ class BaseOpenAIProvider(AnyLLM):
             **kwargs,
         )
         return _convert_moderation_response_from_openai(raw, include_raw=include_raw)
+
+    @override
+    async def _adecide(
+        self, model: str, state: JSONContent, questions: dict[str, Question], **kwargs: Any
+    ) -> DecideResponse:
+        if self.DECIDE_PATH is None:
+            return await super()._adecide(model, state, questions, **kwargs)
+        # The OpenAI SDK has no decisions resource, so post through its client to keep the
+        # provider's auth, retries and error mapping. A per-request timeout and extra headers are
+        # request options there, not body fields.
+        options: RequestOptions = {}
+        if (timeout := kwargs.pop("timeout", None)) is not None:
+            options["timeout"] = timeout
+        if (extra_headers := kwargs.pop("extra_headers", None)) is not None:
+            options["headers"] = extra_headers
+        extra_body = kwargs.pop("extra_body", None) or {}
+        body = {
+            "model": model,
+            "state": state,
+            "questions": {name: question_to_dict(question) for name, question in questions.items()},
+            **kwargs,
+            **extra_body,
+        }
+        response = await self.client.post(
+            str(self.client.base_url.join(self.DECIDE_PATH)),
+            body=body,
+            cast_to=dict[str, Any],
+            options=options,
+        )
+        try:
+            return DecideResponse.model_validate(response)
+        except ValidationError as error:
+            # The validation error can quote the answers, so it stays on the cause.
+            msg = f"{self.PROVIDER_NAME} returned a decisions response that is not valid"
+            raise ProviderError(msg, provider_name=self.PROVIDER_NAME) from error
 
     @override
     async def _alist_models(self, **kwargs: Any) -> Sequence[Model]:

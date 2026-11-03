@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from typing_extensions import override
@@ -21,14 +20,19 @@ from any_llm.types.completion import (
     CreateEmbeddingResponse,
     Function,
     Reasoning,
+    ReasoningEffort,
 )
+from any_llm.utils.aio import aclose_quietly
+from any_llm.utils.embedding import apply_encoding_format, pop_encoding_format
 from any_llm.utils.structured_output import get_json_schema, is_structured_output_type
 
 MISSING_PACKAGES_ERROR = None
 try:
     from google.genai import types
 
+    from .context_cache import ContextCacheUse, prepare_context_cache, report_cache_write
     from .utils import (
+        CodeExecutionState,
         _convert_google_batch_job_to_openai_batch,
         _convert_google_batch_output_to_result,
         _convert_messages,
@@ -39,13 +43,14 @@ try:
         _convert_tool_spec,
         _create_openai_chunk_from_google_chunk,
         _create_openai_embedding_response_from_google,
+        _enable_server_side_tool_invocations,
         _has_additional_properties,
     )
 except ImportError as e:
     MISSING_PACKAGES_ERROR = e
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
     from google import genai
 
@@ -53,7 +58,7 @@ if TYPE_CHECKING:
     from any_llm.types.model import Model
 
 REASONING_EFFORT_TO_THINKING_BUDGETS = {
-    "minimal": 256,
+    "minimal": 1024,
     "low": 1024,
     "medium": 8192,
     "high": 24576,
@@ -69,17 +74,118 @@ REASONING_EFFORT_TO_THINKING_LEVELS = {
     "max": types.ThinkingLevel.HIGH,
 }
 _SUPPORTED_BATCH_ENDPOINTS = frozenset({"/v1/chat/completions"})
-_THINKING_LEVEL_MIN_GEMINI_VERSION = (3, 5)
+_ALL_THINKING_LEVELS = frozenset(REASONING_EFFORT_TO_THINKING_LEVELS.values())
+# Known model capabilities differ within the Gemini 3 family, so these exceptions refine rather than replace
+# the permissive version routing used for custom, dated, and newly released model IDs.
+# Source: https://ai.google.dev/gemini-api/docs/generate-content/thinking#thinking-levels
+_THINKING_LEVELS_BY_MODEL = {
+    "gemini-3.8-flash": frozenset({types.ThinkingLevel.LOW, types.ThinkingLevel.MEDIUM, types.ThinkingLevel.HIGH}),
+    "gemini-3.7-flash": frozenset({types.ThinkingLevel.LOW, types.ThinkingLevel.MEDIUM, types.ThinkingLevel.HIGH}),
+    "gemini-3.6-flash": _ALL_THINKING_LEVELS,
+    "gemini-3.5-flash": _ALL_THINKING_LEVELS,
+    "gemini-3.5-flash-lite": _ALL_THINKING_LEVELS,
+    "gemini-3.1-flash-lite": _ALL_THINKING_LEVELS,
+    "gemini-3.1-pro-preview": frozenset(
+        {types.ThinkingLevel.LOW, types.ThinkingLevel.MEDIUM, types.ThinkingLevel.HIGH}
+    ),
+    "gemini-3.1-flash-image": frozenset({types.ThinkingLevel.MINIMAL, types.ThinkingLevel.HIGH}),
+    "gemini-3.1-flash-lite-image": frozenset({types.ThinkingLevel.MINIMAL, types.ThinkingLevel.HIGH}),
+    "gemini-3-flash-preview": _ALL_THINKING_LEVELS,
+}
+_MAX_THINKING_BUDGET_BY_MODEL = {
+    "gemini-2.5-pro": 32768,
+    "gemini-2.5-flash": 24576,
+    "gemini-2.5-flash-lite": 24576,
+}
 _GEMINI_VERSION_PATTERN = re.compile(r"(?:^|/)gemini-(\d+)(?:\.(\d+))?")
 
 
 def _uses_thinking_level(model_id: str) -> bool:
-    """Gemini 3.5 and newer reject `thinking_budget` and expect `thinking_level` instead."""
+    """Route Gemini 3 and newer to `thinking_level`, including unlisted model IDs."""
     match = _GEMINI_VERSION_PATTERN.search(model_id.lower())
     if match is None:
         return False
-    major, minor = int(match.group(1)), int(match.group(2) or 0)
-    return (major, minor) >= _THINKING_LEVEL_MIN_GEMINI_VERSION
+    return int(match.group(1)) >= 3
+
+
+def _matches_known_model(model_name: str, known_model: str) -> bool:
+    version_suffix = model_name.removeprefix(known_model)
+    return model_name == known_model or (
+        model_name.startswith(known_model) and re.fullmatch(r"(?:-\d+)+", version_suffix) is not None
+    )
+
+
+def _known_thinking_levels(model_name: str) -> frozenset[types.ThinkingLevel] | None:
+    for known_model, supported_levels in _THINKING_LEVELS_BY_MODEL.items():
+        if _matches_known_model(model_name, known_model):
+            return supported_levels
+    return None
+
+
+def _known_max_thinking_budget(model_name: str) -> int | None:
+    for known_model, max_budget in _MAX_THINKING_BUDGET_BY_MODEL.items():
+        if _matches_known_model(model_name, known_model):
+            return max_budget
+    return None
+
+
+def _convert_reasoning_effort(
+    model_id: str,
+    reasoning_effort: ReasoningEffort | None,
+    provider_name: str,
+) -> types.ThinkingConfig | None:
+    if reasoning_effort is None or reasoning_effort == "auto":
+        return None
+
+    parameter_name = "reasoning_effort"
+    model_name = model_id.rsplit("/", maxsplit=1)[-1].lower()
+    supported_levels = _known_thinking_levels(model_name)
+    additional_message = f"'{reasoning_effort}' is not available for model '{model_id}'."
+    if reasoning_effort == "none":
+        if _uses_thinking_level(model_id) or _matches_known_model(model_name, "gemini-2.5-pro"):
+            raise UnsupportedParameterError(parameter_name, provider_name, additional_message)
+        return types.ThinkingConfig(thinking_budget=0)
+
+    if supported_levels is not None or _uses_thinking_level(model_id):
+        thinking_level = REASONING_EFFORT_TO_THINKING_LEVELS.get(reasoning_effort)
+        # Google's OpenAI compatibility contract maps `minimal` to `low` for Gemini 3.1 Pro.
+        # Source: https://ai.google.dev/gemini-api/docs/openai#thinking
+        if _matches_known_model(model_name, "gemini-3.1-pro-preview") and reasoning_effort == "minimal":
+            thinking_level = types.ThinkingLevel.LOW
+        if thinking_level is None or (supported_levels is not None and thinking_level not in supported_levels):
+            raise UnsupportedParameterError(parameter_name, provider_name, additional_message)
+        return types.ThinkingConfig(include_thoughts=True, thinking_level=thinking_level)
+
+    thinking_budget = REASONING_EFFORT_TO_THINKING_BUDGETS.get(reasoning_effort)
+    if thinking_budget is None:
+        raise UnsupportedParameterError(parameter_name, provider_name, additional_message)
+    max_budget = _known_max_thinking_budget(model_name)
+    if max_budget is not None:
+        thinking_budget = min(thinking_budget, max_budget)
+    return types.ThinkingConfig(include_thoughts=True, thinking_budget=thinking_budget)
+
+
+def _convert_response_format(response_format: dict[str, Any] | type | None) -> dict[str, Any]:
+    if is_structured_output_type(response_format):
+        schema = get_json_schema(response_format)
+        schema_key = "response_json_schema" if _has_additional_properties(schema) else "response_schema"
+        return {"response_mime_type": "application/json", schema_key: schema}
+    if not isinstance(response_format, dict):
+        return {}
+
+    response_type = response_format.get("type")
+    if response_type == "json_schema":
+        return {
+            "response_mime_type": "application/json",
+            "response_json_schema": response_format["json_schema"]["schema"],
+        }
+    if response_type == "json_object":
+        return {"response_mime_type": "application/json"}
+    if response_type in (None, "text"):
+        return {}
+
+    msg = f"Unsupported response_format type: {response_type}"
+    raise ValueError(msg)
 
 
 class GoogleProvider(AnyLLM):
@@ -99,8 +205,11 @@ class GoogleProvider(AnyLLM):
     # The genai SDK carries timeout on http_options (in milliseconds), not as a request keyword,
     # so it is translated in _convert_completion_params via _merge_timeout_into_http_options.
     TIMEOUT_SUPPORT = "mapped"
+    # genai retries only when http_options carries retry_options, so it is mapped in _apply_max_retries.
+    MAX_RETRIES_SUPPORT = "mapped"
 
     BUILT_IN_TOOLS: ClassVar[list[Any] | None] = [types.Tool]
+    _READS_CACHE_CONTROL_SIDE_CHANNEL: ClassVar[bool] = True
 
     MISSING_PACKAGES_ERROR = MISSING_PACKAGES_ERROR
 
@@ -127,6 +236,26 @@ class GoogleProvider(AnyLLM):
         if isinstance(http_options, types.HttpOptions) and http_options.timeout is None:
             http_options.timeout = timeout_ms
 
+    @override
+    def _apply_max_retries(self, max_retries: int, client_kwargs: dict[str, Any]) -> None:
+        """Set ``http_options.retry_options`` unless the caller already configured one.
+
+        genai counts the first request as an attempt, so ``attempts`` is one more than
+        ``max_retries``. The caller's http_options is copied rather than mutated, since it
+        may be shared with other clients.
+        """
+        attempts = max_retries + 1
+        http_options = client_kwargs.get("http_options")
+
+        if http_options is None:
+            client_kwargs["http_options"] = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=attempts))
+        elif isinstance(http_options, dict):
+            client_kwargs["http_options"] = {"retry_options": {"attempts": attempts}, **http_options}
+        elif isinstance(http_options, types.HttpOptions) and http_options.retry_options is None:
+            client_kwargs["http_options"] = http_options.model_copy(
+                update={"retry_options": types.HttpRetryOptions(attempts=attempts)}
+            )
+
     @staticmethod
     @override
     def _convert_completion_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
@@ -141,63 +270,43 @@ class GoogleProvider(AnyLLM):
             error_message = "parallel_tool_calls"
             raise UnsupportedParameterError(error_message, provider_name)
 
-        if params.frequency_penalty is not None:
-            kwargs["frequency_penalty"] = params.frequency_penalty
-        if params.max_tokens is not None:
-            kwargs["max_output_tokens"] = params.max_tokens
-        if params.presence_penalty is not None:
-            kwargs["presence_penalty"] = params.presence_penalty
-        if params.reasoning_effort != "auto":
-            if params.reasoning_effort is None or params.reasoning_effort == "none":
-                kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=False)
-            elif _uses_thinking_level(params.model_id):
-                kwargs["thinking_config"] = types.ThinkingConfig(
-                    include_thoughts=True, thinking_level=REASONING_EFFORT_TO_THINKING_LEVELS[params.reasoning_effort]
+        kwargs.update(
+            {
+                option_name: option_value
+                for option_name, option_value in (
+                    ("frequency_penalty", params.frequency_penalty),
+                    ("max_output_tokens", params.max_tokens),
+                    ("presence_penalty", params.presence_penalty),
+                    ("seed", params.seed),
+                    ("service_tier", params.service_tier),
+                    ("temperature", params.temperature),
+                    ("top_p", params.top_p),
                 )
-            else:
-                kwargs["thinking_config"] = types.ThinkingConfig(
-                    include_thoughts=True, thinking_budget=REASONING_EFFORT_TO_THINKING_BUDGETS[params.reasoning_effort]
-                )
-        if params.seed is not None:
-            kwargs["seed"] = params.seed
-        if params.service_tier is not None:
-            kwargs["service_tier"] = params.service_tier
-        if params.temperature is not None:
-            kwargs["temperature"] = params.temperature
+                if option_value is not None
+            }
+        )
+
+        thinking_config = _convert_reasoning_effort(params.model_id, params.reasoning_effort, provider_name)
+        if thinking_config is not None:
+            kwargs["thinking_config"] = thinking_config
         if params.tools is not None:
             kwargs["tools"] = _convert_tool_spec(params.tools, provider_name)
-        if isinstance(params.tool_choice, str):
-            kwargs["tool_config"] = _convert_tool_choice(params.tool_choice)
-        if params.top_p is not None:
-            kwargs["top_p"] = params.top_p
+        if params.tool_choice is not None:
+            kwargs["tool_config"] = _convert_tool_choice(params.tool_choice, provider_name)
+        if tools := kwargs.get("tools"):
+            if tool_config := _enable_server_side_tool_invocations(tools, kwargs.get("tool_config")):
+                kwargs["tool_config"] = tool_config
         if params.stop is not None:
             if isinstance(params.stop, str):
                 kwargs["stop_sequences"] = [params.stop]
             else:
                 kwargs["stop_sequences"] = params.stop
 
-        response_format = params.response_format
-        if is_structured_output_type(response_format):
-            kwargs["response_mime_type"] = "application/json"
-            schema = get_json_schema(response_format)
-            if _has_additional_properties(schema):
-                kwargs["response_json_schema"] = schema
-            else:
-                kwargs["response_schema"] = schema
-        elif isinstance(response_format, dict):
-            response_type = response_format.get("type")
-            if response_type == "json_schema":
-                kwargs["response_mime_type"] = "application/json"
-                kwargs["response_json_schema"] = response_format["json_schema"]["schema"]
-            elif response_type == "json_object":
-                kwargs["response_mime_type"] = "application/json"
-            elif response_type == "text":
-                pass
-            else:
-                msg = f"Unsupported response_format type: {response_type}"
-                raise ValueError(msg)
+        kwargs.update(_convert_response_format(params.response_format))
 
-        formatted_messages, system_instruction = _convert_messages(params.messages, provider_name=provider_name)
+        formatted_messages, system_instruction = _convert_messages(
+            params.messages, provider_name=provider_name, model=params.model_id
+        )
         if system_instruction:
             kwargs["system_instruction"] = system_instruction
 
@@ -243,6 +352,8 @@ class GoogleProvider(AnyLLM):
                 tool_calls=tool_calls,
                 reasoning=Reasoning(content=reasoning_content) if reasoning_content else None,
                 extra_content=message_dict.get("extra_content"),
+                images=message_dict.get("images"),
+                audio=message_dict.get("audio"),
             )
             from typing import Literal
 
@@ -257,13 +368,14 @@ class GoogleProvider(AnyLLM):
                 )
             )
 
-        usage_dict = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            **response_dict.get("usage", {}),
-        }
-        usage = CompletionUsage.model_validate(usage_dict)
+        usage_dict = response_dict.get("usage", {})
+        usage = CompletionUsage(
+            prompt_tokens=usage_dict.get("prompt_tokens", 0),
+            completion_tokens=usage_dict.get("completion_tokens", 0),
+            total_tokens=usage_dict.get("total_tokens", 0),
+            prompt_tokens_details=usage_dict.get("prompt_tokens_details"),
+            completion_tokens_details=usage_dict.get("completion_tokens_details"),
+        )
 
         return ChatCompletion(
             id=response_dict.get("id", ""),
@@ -279,7 +391,8 @@ class GoogleProvider(AnyLLM):
     def _convert_completion_chunk_response(response: Any, **kwargs: Any) -> ChatCompletionChunk:
         """Convert Google chunk response to OpenAI format."""
         tool_call_counter = kwargs.get("tool_call_counter")
-        return _create_openai_chunk_from_google_chunk(response, tool_call_counter)
+        code_execution_state = kwargs.get("code_execution_state")
+        return _create_openai_chunk_from_google_chunk(response, tool_call_counter, code_execution_state)
 
     @staticmethod
     @override
@@ -310,6 +423,7 @@ class GoogleProvider(AnyLLM):
         inputs: str | list[str],
         **kwargs: Any,
     ) -> CreateEmbeddingResponse:
+        encoding_format = pop_encoding_format(kwargs, self.PROVIDER_NAME)
         embedding_kwargs = self._convert_embedding_params(inputs, **kwargs)
         result = await self.client.aio.models.embed_content(
             model=model,
@@ -317,7 +431,7 @@ class GoogleProvider(AnyLLM):
         )
 
         response_data = {"model": model, "result": result}
-        return self._convert_embedding_response(response_data)
+        return apply_encoding_format(self._convert_embedding_response(response_data), encoding_format)
 
     @override
     async def _acompletion(
@@ -327,25 +441,85 @@ class GoogleProvider(AnyLLM):
     ) -> ChatCompletion | AsyncIterator[ChatCompletionChunk]:
         kwargs["provider_name"] = self.PROVIDER_NAME
         converted_kwargs = self._convert_completion_params(params, **kwargs)
+        cache_use = await prepare_context_cache(self.client, self.PROVIDER_NAME, params.messages, converted_kwargs)
 
         if params.stream:
-            response_stream = cast(
-                "AsyncGenerator[types.GenerateContentResponse, None]",
-                await self.client.aio.models.generate_content_stream(**converted_kwargs),
+            response_stream = await self._open_stream_with_context_cache(
+                self.client.aio.models.generate_content_stream, cache_use
             )
 
             async def _stream() -> AsyncIterator[ChatCompletionChunk]:
                 tool_call_counter: list[int] = [0]
-                async with aclosing(response_stream):
+                code_execution_state = CodeExecutionState()
+                try:
                     async for chunk in response_stream:
-                        yield self._convert_completion_chunk_response(chunk, tool_call_counter=tool_call_counter)
+                        converted_chunk = self._convert_completion_chunk_response(
+                            chunk, tool_call_counter=tool_call_counter, code_execution_state=code_execution_state
+                        )
+                        report_cache_write(converted_chunk.usage, cache_use)
+                        yield converted_chunk
+                finally:
+                    await aclose_quietly(response_stream)
 
             return _stream()
 
-        response: types.GenerateContentResponse = await self.client.aio.models.generate_content(**converted_kwargs)
+        response: types.GenerateContentResponse = await self._send_with_context_cache(
+            self.client.aio.models.generate_content, cache_use
+        )
 
-        response_dict = _convert_response_to_response_dict(response)
-        return self._convert_completion_response((response_dict, params.model_id))
+        response_dict = _convert_response_to_response_dict(response, provider_name=self.PROVIDER_NAME)
+        completion = self._convert_completion_response((response_dict, params.model_id))
+        report_cache_write(completion.usage, cache_use)
+        return completion
+
+    @staticmethod
+    async def _send_with_context_cache(send: Callable[..., Awaitable[Any]], cache_use: ContextCacheUse) -> Any:
+        try:
+            return await send(**cache_use.request_kwargs)
+        except Exception as exc:
+            if not cache_use.is_stale_cache_error(exc):
+                raise
+            cache_use.forget()
+            return await send(**cache_use.uncached_kwargs)
+
+    @staticmethod
+    async def _open_stream_with_context_cache(
+        send: Callable[..., Awaitable[AsyncIterator[Any]]], cache_use: ContextCacheUse
+    ) -> AsyncIterator[Any]:
+        """Open a stream, reading its first chunk under the stale-cache retry.
+
+        The SDK may not send the request until the stream is first iterated, so a cache that has gone
+        only surfaces there.
+        """
+
+        async def first_chunk(kwargs: dict[str, Any]) -> tuple[AsyncIterator[Any], list[Any]]:
+            stream = await send(**kwargs)
+            try:
+                return stream, [await anext(stream)]
+            except StopAsyncIteration:
+                return stream, []
+            except BaseException:
+                await aclose_quietly(stream)
+                raise
+
+        try:
+            stream, head = await first_chunk(cache_use.request_kwargs)
+        except Exception as exc:
+            if not cache_use.is_stale_cache_error(exc):
+                raise
+            cache_use.forget()
+            stream, head = await first_chunk(cache_use.uncached_kwargs)
+
+        async def chunks() -> AsyncIterator[Any]:
+            try:
+                for chunk in head:
+                    yield chunk
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                await aclose_quietly(stream)
+
+        return chunks()
 
     @override
     async def _alist_models(self, **kwargs: Any) -> Sequence[Model]:
@@ -389,14 +563,9 @@ class GoogleProvider(AnyLLM):
             if not line.strip():
                 continue
             entry = json.loads(line)
-            req = _convert_openai_request_to_inlined_request(entry, provider_name=self.PROVIDER_NAME)
-            if model_override:
-                req = types.InlinedRequest(
-                    model=model_override,
-                    contents=req.contents,
-                    config=req.config,
-                    metadata=req.metadata,
-                )
+            req = _convert_openai_request_to_inlined_request(
+                entry, provider_name=self.PROVIDER_NAME, model=model_override
+            )
             inlined_requests.append(req)
             if not first_model and req.model:
                 first_model = req.model

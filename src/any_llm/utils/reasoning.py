@@ -1,8 +1,9 @@
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from typing import Any, Literal, TypeVar
 
 from any_llm.constants import REASONING_FIELD_NAMES
+from any_llm.utils.aio import aclose_quietly
 
 T = TypeVar("T")
 
@@ -77,76 +78,79 @@ async def process_streaming_reasoning_chunks(
     held_chunks: list[T] = []
     last_chunk_was_yielded = False
 
-    async for original_chunk in chunks:
-        content = get_content(original_chunk)
+    try:
+        async for original_chunk in chunks:
+            content = get_content(original_chunk)
 
-        if not content:
+            if not content:
+                if is_terminal(original_chunk) and (buffer or reasoning_buffer):
+                    held_chunks.append(original_chunk)
+                else:
+                    yield original_chunk
+                continue
+
+            last_chunk = original_chunk
+            last_chunk_was_yielded = False
+            buffer += content
+            content_parts = []
+            reasoning_parts = []
+
+            while buffer:
+                if current_tag is None:
+                    tag_info = find_reasoning_tag(buffer, opening=True)
+                    if tag_info:
+                        tag_start, tag_name = tag_info
+                        if tag_start > 0:
+                            content_parts.append(buffer[:tag_start])
+                        tag_full = f"<{tag_name}>"
+                        buffer = buffer[tag_start + len(tag_full) :]
+                        current_tag = tag_name
+                    else:
+                        partial_len = partial_reasoning_tag_suffix_len(buffer, tag_kind="opening")
+                        if partial_len:
+                            if partial_len < len(buffer):
+                                content_parts.append(buffer[:-partial_len])
+                            buffer = buffer[len(buffer) - partial_len :]
+                            break
+                        content_parts.append(buffer)
+                        buffer = ""
+                else:
+                    tag_close = f"</{current_tag}>"
+                    tag_end = buffer.find(tag_close)
+                    if tag_end != -1:
+                        reasoning_parts.append(reasoning_buffer + buffer[:tag_end])
+                        reasoning_buffer = ""
+                        buffer = buffer[tag_end + len(tag_close) :]
+                        current_tag = None
+                    else:
+                        partial_len = partial_reasoning_tag_suffix_len(buffer, tag_kind="closing")
+                        if partial_len:
+                            reasoning_buffer += buffer[: len(buffer) - partial_len]
+                            buffer = buffer[len(buffer) - partial_len :]
+                            break
+                        reasoning_buffer += buffer
+                        buffer = ""
+
             if is_terminal(original_chunk) and (buffer or reasoning_buffer):
-                held_chunks.append(original_chunk)
-            else:
-                yield original_chunk
-            continue
+                terminal_chunk = original_chunk
+                terminal_content_parts.extend(content_parts)
+                terminal_reasoning_parts.extend(reasoning_parts)
+                continue
 
-        last_chunk = original_chunk
-        last_chunk_was_yielded = False
-        buffer += content
-        content_parts = []
-        reasoning_parts = []
-
-        while buffer:
-            if current_tag is None:
-                tag_info = find_reasoning_tag(buffer, opening=True)
-                if tag_info:
-                    tag_start, tag_name = tag_info
-                    if tag_start > 0:
-                        content_parts.append(buffer[:tag_start])
-                    tag_full = f"<{tag_name}>"
-                    buffer = buffer[tag_start + len(tag_full) :]
-                    current_tag = tag_name
-                else:
-                    partial_len = partial_reasoning_tag_suffix_len(buffer, tag_kind="opening")
-                    if partial_len:
-                        if partial_len < len(buffer):
-                            content_parts.append(buffer[:-partial_len])
-                        buffer = buffer[len(buffer) - partial_len :]
-                        break
-                    content_parts.append(buffer)
-                    buffer = ""
-            else:
-                tag_close = f"</{current_tag}>"
-                tag_end = buffer.find(tag_close)
-                if tag_end != -1:
-                    reasoning_parts.append(reasoning_buffer + buffer[:tag_end])
-                    reasoning_buffer = ""
-                    buffer = buffer[tag_end + len(tag_close) :]
-                    current_tag = None
-                else:
-                    partial_len = partial_reasoning_tag_suffix_len(buffer, tag_kind="closing")
-                    if partial_len:
-                        reasoning_buffer += buffer[: len(buffer) - partial_len]
-                        buffer = buffer[len(buffer) - partial_len :]
-                        break
-                    reasoning_buffer += buffer
-                    buffer = ""
-
-        if is_terminal(original_chunk) and (buffer or reasoning_buffer):
-            terminal_chunk = original_chunk
-            terminal_content_parts.extend(content_parts)
-            terminal_reasoning_parts.extend(reasoning_parts)
-            continue
-
-        if content_parts or reasoning_parts:
-            modified_chunk = original_chunk.model_copy(deep=True)  # type: ignore[attr-defined]
-            modified_chunk = set_content(modified_chunk, "".join(content_parts) if content_parts else None)
-            if reasoning_parts:
-                modified_chunk = set_reasoning(modified_chunk, "".join(reasoning_parts))
-            yield modified_chunk
-            last_chunk_was_yielded = True
-        elif not buffer:
-            modified_chunk = original_chunk.model_copy(deep=True)  # type: ignore[attr-defined]
-            modified_chunk = set_content(modified_chunk, None)
-            yield modified_chunk
-            last_chunk_was_yielded = True
+            if content_parts or reasoning_parts:
+                modified_chunk = original_chunk.model_copy(deep=True)  # type: ignore[attr-defined]
+                modified_chunk = set_content(modified_chunk, "".join(content_parts) if content_parts else None)
+                if reasoning_parts:
+                    modified_chunk = set_reasoning(modified_chunk, "".join(reasoning_parts))
+                yield modified_chunk
+                last_chunk_was_yielded = True
+            elif not buffer:
+                modified_chunk = original_chunk.model_copy(deep=True)  # type: ignore[attr-defined]
+                modified_chunk = set_content(modified_chunk, None)
+                yield modified_chunk
+                last_chunk_was_yielded = True
+    finally:
+        await aclose_quietly(chunks)
 
     if terminal_chunk is not None:
         final_chunk = terminal_chunk.model_copy(deep=True)  # type: ignore[attr-defined]
@@ -178,12 +182,85 @@ async def process_streaming_reasoning_chunks(
         yield held_chunk
 
 
+def _without_extra_content(container: dict[str, Any], keep_namespaces: Collection[str]) -> dict[str, Any]:
+    """Return ``container`` without the ``extra_content`` namespaces outside ``keep_namespaces``."""
+    if "extra_content" not in container:
+        return container
+    extra_content = container["extra_content"]
+    kept = (
+        {namespace: value for namespace, value in extra_content.items() if namespace in keep_namespaces}
+        if isinstance(extra_content, dict)
+        else {}
+    )
+    if kept and kept == extra_content:
+        return container
+    cleaned = {key: value for key, value in container.items() if key != "extra_content"}
+    if kept:
+        cleaned["extra_content"] = kept
+    return cleaned
+
+
+def strip_extra_content(
+    messages: list[dict[str, Any]], *, keep_namespaces: Collection[str] = ()
+) -> list[dict[str, Any]]:
+    """Drop the ``extra_content`` side-channel from messages and from their tool calls.
+
+    any_llm keeps provider signatures and replayed reasoning in ``extra_content``: on a message
+    (Anthropic thinking signatures, DeepSeek reasoning) and on a tool call (Gemini thought
+    signatures). The OpenAI schema has no such field, the OpenAI SDK forwards unknown message keys
+    verbatim, and strict OpenAI-compatible backends reject the whole request over one, so a
+    conversation carrying another provider's signature would fail on its next turn.
+
+    Namespaces in ``keep_namespaces`` stay, because for some backends they are the wire format:
+    Gemini's OpenAI-compatible API reads a replayed tool call's thought signature from
+    ``extra_content["google"]``. The key is dropped outright when nothing is kept, since an empty
+    ``extra_content`` is still an unknown key. A provider that reads the side-channel has to do so
+    before calling this. The input is never mutated, and a message or tool call with nothing to
+    strip is returned as the same object.
+    """
+    result = []
+    for message in messages:
+        cleaned = _without_extra_content(message, keep_namespaces)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            cleaned_calls = [
+                _without_extra_content(call, keep_namespaces) if isinstance(call, dict) else call for call in tool_calls
+            ]
+            if any(new is not old for new, old in zip(cleaned_calls, tool_calls, strict=True)):
+                cleaned = {**cleaned, "tool_calls": cleaned_calls}
+        result.append(cleaned)
+    return result
+
+
+def replay_reasoning_content_as_reasoning(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rename a replayed ``reasoning_content`` to ``reasoning`` and drop ``extra_content``.
+
+    For providers whose SDK names the assistant reasoning field ``reasoning`` and whose API rejects
+    any other message key: Groq and Cerebras return 400 ``property 'reasoning_content' is
+    unsupported``. The Messages bridge emits ``reasoning_content`` from a replayed ``thinking``
+    block, and a caller of plain ``completion()`` may send it directly in the shape DeepSeek
+    expects; both are renamed. An explicit ``reasoning`` the caller already set wins over
+    ``reasoning_content``.
+    """
+    result = []
+    for message in strip_extra_content(messages):
+        if "reasoning_content" not in message:
+            result.append(message)
+            continue
+        cleaned = {key: value for key, value in message.items() if key != "reasoning_content"}
+        reasoning_content = message["reasoning_content"]
+        if isinstance(reasoning_content, str) and reasoning_content and "reasoning" not in cleaned:
+            cleaned["reasoning"] = reasoning_content
+        result.append(cleaned)
+    return result
+
+
 def normalize_reasoning_from_provider_fields_and_xml_tags(message_dict: dict[str, Any]) -> None:
     """Extract and normalize reasoning from provider fields and XML tags.
 
     This function mutates the message_dict in place:
     1. First checks for reasoning in provider-specific fields (reasoning_content, thinking, etc.)
-    2. Then extracts reasoning from XML tags in content (<think>, <thinking>, etc.)
+    2. Then extracts reasoning from XML tags in content in textual order (<think>, <thinking>, etc.)
     3. Combines both sources if both exist
     4. Removes XML tags from content and stores reasoning separately
 
@@ -207,18 +284,19 @@ def normalize_reasoning_from_provider_fields_and_xml_tags(message_dict: dict[str
 
     content = message_dict.get("content")
     if isinstance(content, str):
-        for tag_name in REASONING_FIELD_NAMES:
-            tag_open = f"<{tag_name}>"
-            tag_close = f"</{tag_name}>"
-            think_pattern = re.escape(tag_open) + r"(.*?)" + re.escape(tag_close)
-            matches = re.findall(think_pattern, content, re.DOTALL)
-            if matches:
-                extracted_reasoning = "\n".join(matches)
-                if reasoning_content:
-                    reasoning_content = f"{reasoning_content}\n{extracted_reasoning}"
-                else:
-                    reasoning_content = extracted_reasoning
-                content = re.sub(think_pattern, "", content, flags=re.DOTALL).strip()
+        tag_names = "|".join(re.escape(tag_name) for tag_name in REASONING_FIELD_NAMES)
+        think_pattern = re.compile(rf"<(?P<tag>{tag_names})>(?P<reasoning>.*?)</(?P=tag)>", re.DOTALL)
+        matches = [match.group("reasoning") for match in think_pattern.finditer(content)]
+        if matches:
+            # An empty block contributes no reasoning, so it must not contribute a separator
+            # either: joining ["", "B"] verbatim would report reasoning that opens with a blank
+            # line, and ["", ""] would report a lone newline as if it were reasoning.
+            extracted_reasoning = "\n".join(match for match in matches if match)
+            if reasoning_content:
+                reasoning_content = f"{reasoning_content}\n{extracted_reasoning}"
+            else:
+                reasoning_content = extracted_reasoning
+            content = think_pattern.sub("", content).strip()
 
         message_dict["content"] = content
 
