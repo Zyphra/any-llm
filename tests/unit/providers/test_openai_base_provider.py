@@ -1,18 +1,81 @@
+import asyncio
 import dataclasses
+import email
+import email.message
+import io
 import json
 import logging
-from typing import Any, cast
+import pathlib
+from collections.abc import AsyncIterator
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from openai.types.responses import ResponseCompactionItem, ResponseOutputMessage, ResponseOutputText
+from openai import AsyncStream
+from openai.types.responses import (
+    ResponseCompactionItem,
+    ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseError,
+    ResponseErrorEvent,
+    ResponseFailedEvent,
+    ResponseFunctionToolCall,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+    ResponseReasoningSummaryPartAddedEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseRefusalDeltaEvent,
+)
+from openai.types.responses.response_reasoning_item import Content, Summary
+from openai.types.responses.response_reasoning_summary_part_added_event import Part
+from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails, ResponseUsage
 from openresponses_types import CompactionBody, ResponseResource
 from pydantic import BaseModel
+from typing_extensions import override
 
-from any_llm.providers.openai.base import BaseOpenAIProvider
+from any_llm.exceptions import InvalidRequestError, ProviderError, UnsupportedParameterError
+from any_llm.providers.azureopenai.azureopenai import AzureopenaiProvider
+from any_llm.providers.openai.base import BaseOpenAIProvider, OpenAIChunkStream
+from any_llm.providers.openai.messages_responses import (
+    ResponsesStreamingState,
+    convert_responses_stream,
+    messages_params_to_responses_params,
+    response_stream_event_to_message_events,
+    response_to_message_response,
+)
 from any_llm.providers.openai.openai import OpenaiProvider
-from any_llm.types.completion import CompletionParams
+from any_llm.providers.openrouter.openrouter import OpenrouterProvider
+from any_llm.providers.sambanova.sambanova import SambanovaProvider
+from any_llm.types.audio import Transcription
+from any_llm.types.completion import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessage,
+    Choice,
+    ChoiceDelta,
+    ChunkChoice,
+    CompletionParams,
+    CompletionUsage,
+)
+from any_llm.types.messages import (
+    ContentBlockDeltaEvent,
+    ContentBlockStartEvent,
+    InputJSONDelta,
+    MessageDeltaEvent,
+    MessageResponse,
+    MessagesParams,
+    MessageStartEvent,
+    MessageStopEvent,
+    TextBlock,
+    TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
+    ToolUseBlock,
+)
 from any_llm.types.model import Model
 from any_llm.types.responses import ParsedResponse, Response
 from any_llm.utils.structured_output import parse_responses_output
@@ -69,6 +132,64 @@ async def test_openai_messages_bridge_sends_typed_prompt_cache_key() -> None:
     assert json.loads(requests[0].content)["prompt_cache_key"] == "tenant-1"
 
 
+async def _wire_body_of_openai_call(call: str, **kwargs: object) -> str:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5.6",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenaiProvider(api_key="test-key", http_client=http_client)
+    try:
+        await getattr(provider, call)(model="gpt-5.6", **kwargs)
+    finally:
+        await http_client.aclose()
+    assert len(requests) == 1
+    return requests[0].content.decode()
+
+
+@pytest.mark.asyncio
+async def test_openai_messages_bridge_never_sends_cache_control_breakpoints() -> None:
+    ephemeral = {"type": "ephemeral", "ttl": "1h"}
+
+    body = await _wire_body_of_openai_call(
+        "amessages",
+        system=[{"type": "text", "text": "Be brief.", "cache_control": ephemeral}],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Hello", "cache_control": ephemeral}]}],
+        cache_control=ephemeral,
+        max_tokens=100,
+    )
+
+    assert "cache_control" not in body
+    assert "extra_content" not in body
+    assert json.loads(body)["messages"][0] == {"role": "system", "content": "Be brief."}
+
+
+@pytest.mark.asyncio
+async def test_openai_completion_drops_the_cache_control_side_channel() -> None:
+    body = await _wire_body_of_openai_call(
+        "acompletion",
+        messages=[
+            {"role": "system", "content": "Be brief.", "extra_content": {"cache_control": {"type": "ephemeral"}}},
+            {"role": "user", "content": "Hello"},
+        ],
+    )
+
+    assert "cache_control" not in body
+    assert "extra_content" not in body
+
+
 class _City(BaseModel):
     city_name: str
 
@@ -104,22 +225,6 @@ def _make_openai_response(text: str) -> Response:
         tool_choice="auto",
         tools=[],
     )
-
-
-@pytest.mark.asyncio
-async def test_completion_stream_closes_openai_sdk_stream_when_cancelled() -> None:
-    """Cancellation must exit the OpenAI SDK stream context."""
-    provider = _ResponsesProvider(api_key="test-key")
-    sdk_stream = MagicMock()
-    sdk_stream.__aiter__.return_value = iter([MagicMock()])
-
-    with patch.object(provider, "_convert_completion_chunk_response", return_value=MagicMock()):
-        result = provider._convert_completion_response_async(cast("Any", sdk_stream))
-        stream = cast("Any", result)
-        await anext(stream)
-        await stream.aclose()
-
-    sdk_stream.__aexit__.assert_awaited_once()
 
 
 def _make_openai_compaction_response() -> Response:
@@ -279,6 +384,45 @@ async def test_aresponses_without_response_format_returns_response(mock_openai_c
     assert "context_management" not in mock_client.responses.create.call_args.kwargs
     assert isinstance(result, Response)
     assert not isinstance(result, ParsedResponse)
+
+
+@pytest.mark.asyncio
+@patch("any_llm.providers.openai.base.AsyncOpenAI")
+async def test_openai_aresponses_returns_its_own_response_with_every_field(mock_openai_class: MagicMock) -> None:
+    """OpenAI's reply stays an openai Response: a ResponseResource would drop cache_write_tokens."""
+    reply = Response.model_validate(
+        {
+            **_make_openai_response("hi").model_dump(),
+            # the fields a real OpenAI reply carries, so the ResponseResource conversion would succeed
+            "status": "completed",
+            "truncation": "disabled",
+            "text": {"format": {"type": "text"}},
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "store": True,
+            "background": False,
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 8},
+                "output_tokens": 1,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 11,
+            },
+        }
+    )
+    mock_client = AsyncMock()
+    mock_client.responses.create = AsyncMock(return_value=reply)
+    mock_openai_class.return_value = mock_client
+
+    result = await OpenaiProvider(api_key="key").aresponses(model="gpt-5.6", input_data="hi")
+
+    assert isinstance(result, Response)
+    assert result.usage is not None
+    assert result.usage.input_tokens_details.cache_write_tokens == 8
 
 
 @pytest.mark.asyncio
@@ -520,6 +664,58 @@ async def test_stream_with_basemodel_response_format_uses_create_json_schema() -
         mock_client.chat.completions.parse.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_acompletion_strips_extra_content_but_keeps_gemini_thought_signatures() -> None:
+    """Strict OpenAI-compatible backends reject extra_content, but Gemini's needs its google namespace back."""
+
+    class TestProvider(BaseOpenAIProvider):
+        PROVIDER_NAME = "TestProvider"
+        ENV_API_KEY_NAME = "TEST_API_KEY"
+        PROVIDER_DOCUMENTATION_URL = "https://example.com"
+
+    with patch("any_llm.providers.openai.base.AsyncOpenAI") as mock_openai_class:
+        mock_client = AsyncMock()
+        mock_openai_class.return_value = mock_client
+        mock_client.chat.completions.create = AsyncMock(return_value=MagicMock())
+
+        provider = TestProvider(api_key="test-key")
+        await provider._acompletion(
+            CompletionParams(
+                model_id="test-model",
+                messages=[
+                    {"role": "user", "content": "Weather?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "extra_content": {"anthropic": {"signature": "sig"}},
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{}"},
+                                "extra_content": {"google": {"thought_signature": "c2ln"}},
+                            }
+                        ],
+                    },
+                ],
+            )
+        )
+
+        sent = mock_client.chat.completions.create.call_args.kwargs["messages"]
+        assert sent[1] == {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                    "extra_content": {"google": {"thought_signature": "c2ln"}},
+                }
+            ],
+        }
+
+
 def test_base_provider_maps_max_tokens_to_max_completion_tokens() -> None:
     params = CompletionParams(model_id="model", messages=[{"role": "user", "content": "hi"}], max_tokens=8192)
     result = BaseOpenAIProvider._convert_completion_params(params)
@@ -627,3 +823,1051 @@ async def test_acompletion_with_dataclass_uses_create_not_parse() -> None:
 
         mock_client.chat.completions.create.assert_called_once()
         mock_client.chat.completions.parse.assert_not_called()
+
+
+class _TrackedStream(httpx.AsyncByteStream):
+    """An SSE body that records whether the SDK released it."""
+
+    def __init__(self, mode: str, api: str) -> None:
+        self.closed = False
+        self.mode = mode
+        self.api = api
+        self.waiting = asyncio.Event()
+
+    @override
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self.api == "chat":
+            yield (
+                b'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-5.6",'
+                b'"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}\n\n'
+            )
+        else:
+            yield (
+                b'data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg",'
+                b'"output_index":0,"content_index":0,"delta":"Hi"}\n\n'
+            )
+        if self.mode == "failure":
+            message = "stream failed"
+            raise ValueError(message)
+        if self.mode == "cancellation":
+            self.waiting.set()
+            await asyncio.Event().wait()
+        yield b"data: [DONE]\n\n"
+
+    @override
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["exhaustion", "early_exit", "failure", "cancellation", "zero_consumption"])
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("provider_type", [OpenaiProvider, SambanovaProvider])
+async def test_stream_releases_transport(mode: str, api: str, provider_type: type[BaseOpenAIProvider]) -> None:
+    """Every way a caller can leave a stream, including before the first read, releases the HTTP body."""
+    if provider_type is SambanovaProvider and api == "responses":
+        pytest.skip("SambaNova does not support the Responses API")
+    body = _TrackedStream(mode, api)
+    provider = provider_type(
+        api_key="key",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+            )
+        ),
+    )
+    try:
+        stream = (
+            await provider.acompletion(model="gpt-5.6", messages=[{"role": "user", "content": "Hi"}], stream=True)
+            if api == "chat"
+            else await provider.aresponses(model="gpt-5.6", input_data="Hi", stream=True)
+        )
+        assert isinstance(stream, AsyncIterator)
+        if mode == "zero_consumption":
+            await stream.aclose()  # type: ignore[union-attr]
+        else:
+            await anext(stream)
+        if mode == "early_exit":
+            await stream.aclose()  # type: ignore[union-attr]
+        elif mode == "failure":
+            with (
+                pytest.warns(DeprecationWarning, match="Provider-specific exceptions"),
+                pytest.raises(ValueError, match="stream failed"),
+            ):
+                await anext(stream)
+        elif mode == "cancellation":
+            task = asyncio.ensure_future(anext(stream))
+            await body.waiting.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif mode == "exhaustion":
+            assert [chunk async for chunk in stream] == []
+        assert body.closed
+    finally:
+        await provider.client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["exhaustion", "read_error", "conversion_error", "cancellation"])
+async def test_chunk_stream_preserves_outcome_when_close_fails(outcome: str) -> None:
+    error = ValueError("original failure")
+
+    async def chunks() -> AsyncIterator[MagicMock]:
+        if outcome == "read_error":
+            raise error
+        if outcome == "cancellation":
+            raise asyncio.CancelledError
+        if outcome == "conversion_error":
+            yield MagicMock()
+
+    response = MagicMock(spec=AsyncStream)
+    response.__aiter__.side_effect = chunks
+    close = AsyncMock(side_effect=RuntimeError("cleanup failure"))
+    setattr(response, "aclose" if hasattr(response, "aclose") else "close", close)
+    convert = MagicMock(side_effect=error)
+    stream = OpenAIChunkStream(response, convert)
+    expected = (
+        StopAsyncIteration
+        if outcome == "exhaustion"
+        else asyncio.CancelledError
+        if outcome == "cancellation"
+        else ValueError
+    )
+    with pytest.raises(expected):
+        await anext(stream)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    await stream.aclose()
+    close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consume_first", [False, True])
+async def test_chunk_stream_stops_after_close(consume_first: bool) -> None:
+    response = MagicMock(spec=AsyncStream)
+    response.__aiter__.return_value = [MagicMock(), MagicMock()]
+    close = AsyncMock()
+    setattr(response, "aclose" if hasattr(response, "aclose") else "close", close)
+    stream = OpenAIChunkStream(response, MagicMock())
+    if consume_first:
+        await anext(stream)
+    await stream.aclose()
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    close.assert_awaited_once()
+
+
+_WEATHER_TOOL = {
+    "name": "get_weather",
+    "description": "Get the weather",
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}
+
+
+def _make_responses_result_with_tool_call(*, with_summary: bool = True) -> Response:
+    """Fixture shaped like a live Responses tools+thinking result.
+
+    Summary text is only present when ``with_summary=True``. Live OpenAI returns a
+    non-empty summary only when the request set ``reasoning.summary="auto"``; without
+    that the reasoning item arrives with ``summary=[]`` and no ThinkingBlock.
+    """
+    summary = [Summary(type="summary_text", text="need weather")] if with_summary else []
+    reasoning = ResponseReasoningItem(
+        id="rs-1",
+        type="reasoning",
+        summary=summary,
+    )
+    tool_call = ResponseFunctionToolCall(
+        type="function_call",
+        call_id="call_weather",
+        name="get_weather",
+        arguments='{"city":"Paris"}',
+    )
+    return Response(
+        id="resp-tools",
+        created_at=0,
+        model="gpt-5.6",
+        object="response",
+        output=[reasoning, tool_call],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+        status="completed",
+        usage=ResponseUsage(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=2),
+        ),
+    )
+
+
+def test_messages_params_to_responses_params_sets_summary_auto() -> None:
+    """Thinking enabled → Responses reasoning must request summary=auto (#1432 QA)."""
+    params = MessagesParams(
+        model="gpt-5.6",
+        max_tokens=128,
+        messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+        tools=[_WEATHER_TOOL],
+        thinking={"type": "enabled", "budget_tokens": 2048},
+    )
+    converted = messages_params_to_responses_params(params)
+    assert converted.reasoning == {"effort": "low", "summary": "auto"}
+    assert converted.tools is not None
+    assert converted.tools[0]["name"] == "get_weather"
+
+
+@pytest.mark.parametrize(
+    ("thinking", "expected"),
+    [
+        (None, {"effort": "high"}),
+        ({"type": "enabled", "budget_tokens": 2048}, {"effort": "high", "summary": "auto"}),
+        ({"type": "disabled"}, None),
+    ],
+)
+def test_messages_params_to_responses_params_carries_output_config_effort(
+    thinking: dict[str, Any] | None, expected: dict[str, Any] | None
+) -> None:
+    """output_config.effort sets the Responses reasoning effort, over a thinking budget."""
+    params = MessagesParams(
+        model="gpt-5.6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+        thinking=thinking,
+        output_format={"effort": "high"},
+    )
+    assert messages_params_to_responses_params(params).reasoning == expected
+
+
+def test_response_to_message_response_thinking_requires_summary_text() -> None:
+    """Empty summary (live without summary=auto) → no ThinkingBlock; filled summary → ThinkingBlock."""
+    empty = response_to_message_response(_make_responses_result_with_tool_call(with_summary=False))
+    assert not any(isinstance(b, ThinkingBlock) for b in empty.content)
+    assert any(isinstance(b, ToolUseBlock) for b in empty.content)
+
+    filled = response_to_message_response(_make_responses_result_with_tool_call(with_summary=True))
+    thinking = [b for b in filled.content if isinstance(b, ThinkingBlock)]
+    assert len(thinking) == 1
+    assert thinking[0].thinking == "need weather"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cls", [OpenaiProvider, AzureopenaiProvider])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_amessages_tools_and_thinking_routes_to_responses(
+    provider_cls: type[OpenaiProvider] | type[AzureopenaiProvider],
+    stream: bool,
+) -> None:
+    """tools + thinking must use Responses on every BaseOpenAI SUPPORTS_RESPONSES provider (#1432)."""
+
+    async def live_like_stream() -> AsyncIterator[Any]:
+        created = Response(
+            id="resp-stream",
+            created_at=0,
+            model="gpt-5.6",
+            object="response",
+            output=[],
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+        )
+        reasoning = ResponseReasoningItem(id="rs-1", type="reasoning", summary=[])
+        tool_call = ResponseFunctionToolCall(
+            type="function_call",
+            call_id="call_weather",
+            name="get_weather",
+            arguments='{"city":"Paris"}',
+        )
+        yield ResponseCreatedEvent(type="response.created", sequence_number=0, response=created)
+        yield ResponseOutputItemAddedEvent(
+            type="response.output_item.added", sequence_number=1, output_index=0, item=reasoning
+        )
+        # Live only emits these deltas when the request asked for reasoning.summary=auto.
+        yield ResponseReasoningSummaryTextDeltaEvent(
+            type="response.reasoning_summary_text.delta",
+            sequence_number=2,
+            item_id="rs-1",
+            output_index=0,
+            summary_index=0,
+            delta="need weather",
+        )
+        yield ResponseOutputItemDoneEvent(
+            type="response.output_item.done", sequence_number=3, output_index=0, item=reasoning
+        )
+        yield ResponseOutputItemAddedEvent(
+            type="response.output_item.added", sequence_number=4, output_index=1, item=tool_call
+        )
+        yield ResponseOutputItemDoneEvent(
+            type="response.output_item.done", sequence_number=5, output_index=1, item=tool_call
+        )
+        done = created.model_copy(update={"output": [reasoning, tool_call], "status": "completed"})
+        yield ResponseCompletedEvent(type="response.completed", sequence_number=6, response=done)
+
+    init_kwargs: dict[str, Any] = {"api_key": "test-key"}
+    if provider_cls is AzureopenaiProvider:
+        init_kwargs["api_base"] = "https://resource.openai.azure.com"
+
+    with patch.object(provider_cls, "_init_client"):
+        provider = provider_cls(**init_kwargs)
+        mock_aresponses = AsyncMock(
+            return_value=live_like_stream() if stream else _make_responses_result_with_tool_call(with_summary=True)
+        )
+        mock_acompletion = AsyncMock()
+        with (
+            patch.object(provider_cls, "_aresponses", mock_aresponses),
+            patch.object(BaseOpenAIProvider, "_acompletion", mock_acompletion),
+        ):
+            result = await provider.amessages(
+                model="gpt-5.6",
+                max_tokens=128,
+                thinking={"type": "enabled", "budget_tokens": 2048},
+                tools=[_WEATHER_TOOL],
+                messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+                stream=stream,
+            )
+
+            mock_aresponses.assert_awaited_once()
+            mock_acompletion.assert_not_called()
+            responses_params = mock_aresponses.call_args.args[0]
+            assert responses_params.tools is not None
+            assert responses_params.tools[0]["name"] == "get_weather"
+            assert "function" not in responses_params.tools[0]
+            assert responses_params.reasoning == {"effort": "low", "summary": "auto"}
+            assert responses_params.stream is stream
+
+            if stream:
+                events = [event async for event in result]  # type: ignore[union-attr]
+                assert isinstance(events[0], MessageStartEvent)
+                assert isinstance(events[-1], MessageStopEvent)
+                starts = [e for e in events if isinstance(e, ContentBlockStartEvent)]
+                assert any(isinstance(e.content_block, ThinkingBlock) for e in starts)
+                deltas = [e for e in events if isinstance(e, ContentBlockDeltaEvent)]
+                assert any(isinstance(e.delta, ThinkingDelta) and e.delta.thinking == "need weather" for e in deltas)
+            else:
+                assert isinstance(result, MessageResponse)
+                assert result.stop_reason == "tool_use"
+                assert any(isinstance(block, ToolUseBlock) for block in result.content)
+                assert any(isinstance(block, ThinkingBlock) for block in result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cls", [OpenaiProvider, AzureopenaiProvider])
+@pytest.mark.parametrize(
+    ("tools", "thinking"),
+    [
+        ([_WEATHER_TOOL], None),
+        ([_WEATHER_TOOL], {"type": "disabled"}),
+        (None, {"type": "enabled", "budget_tokens": 2048}),
+        (None, None),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+async def test_amessages_without_tools_and_thinking_keeps_completions(
+    provider_cls: type[OpenaiProvider] | type[AzureopenaiProvider],
+    tools: list[dict[str, Any]] | None,
+    thinking: dict[str, Any] | None,
+    stream: bool,
+) -> None:
+    """tools without thinking, thinking without tools, or neither → Completions bridge."""
+
+    async def empty_chunk_stream() -> AsyncIterator[Any]:
+        yield ChatCompletionChunk(
+            id="chatcmpl-1",
+            created=0,
+            model="gpt-5.6",
+            object="chat.completion.chunk",
+            choices=[ChunkChoice(index=0, delta=ChoiceDelta(role="assistant", content="ok"), finish_reason="stop")],
+            usage=CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    completion = ChatCompletion(
+        id="chatcmpl-1",
+        created=0,
+        model="gpt-5.6",
+        object="chat.completion",
+        choices=[
+            Choice(
+                index=0,
+                finish_reason="stop",
+                message=ChatCompletionMessage(role="assistant", content="ok"),
+            )
+        ],
+        usage=CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    init_kwargs: dict[str, Any] = {"api_key": "test-key"}
+    if provider_cls is AzureopenaiProvider:
+        init_kwargs["api_base"] = "https://resource.openai.azure.com"
+
+    with patch.object(provider_cls, "_init_client"):
+        provider = provider_cls(**init_kwargs)
+        mock_aresponses = AsyncMock()
+        mock_acompletion = AsyncMock(return_value=empty_chunk_stream() if stream else completion)
+        with (
+            patch.object(provider_cls, "_aresponses", mock_aresponses),
+            patch.object(BaseOpenAIProvider, "_acompletion", mock_acompletion),
+        ):
+            kwargs: dict[str, Any] = {
+                "model": "gpt-5.6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": stream,
+            }
+            if tools is not None:
+                kwargs["tools"] = tools
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+
+            result = await provider.amessages(**kwargs)
+
+            mock_acompletion.assert_awaited_once()
+            mock_aresponses.assert_not_called()
+            if stream:
+                events = [event async for event in result]  # type: ignore[union-attr]
+                assert isinstance(events[0], MessageStartEvent)
+            else:
+                assert isinstance(result, MessageResponse)
+
+
+def test_messages_params_to_responses_params_output_format() -> None:
+    """A usable schema maps to the Responses text.format shape; a named format without one raises."""
+    schema = {"title": "Weather", "type": "object", "properties": {"city": {"type": "string"}}}
+    base: dict[str, Any] = {
+        "model": "gpt-5.6",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "What's the weather in Paris?"}],
+        "tools": [_WEATHER_TOOL],
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+    }
+
+    converted = messages_params_to_responses_params(
+        MessagesParams(**base, output_format={"format": {"type": "json_schema", "schema": schema}})
+    )
+    assert converted.response_format == {"type": "json_schema", "name": "Weather", "schema": schema}
+
+    with pytest.raises(InvalidRequestError, match="no JSON schema"):
+        messages_params_to_responses_params(MessagesParams(**base, output_format={"format": {"type": "json_schema"}}))
+
+
+@pytest.mark.asyncio
+async def test_amessages_tools_and_thinking_rejects_stop_sequences() -> None:
+    """Responses has no stop parameter, so stop_sequences must fail loudly rather than be dropped."""
+    with patch.object(OpenaiProvider, "_init_client"):
+        provider = OpenaiProvider(api_key="test-key")
+        mock_aresponses = AsyncMock()
+        with patch.object(OpenaiProvider, "_aresponses", mock_aresponses):
+            with pytest.raises(UnsupportedParameterError, match="stop_sequences"):
+                await provider.amessages(
+                    model="gpt-5.6",
+                    max_tokens=128,
+                    thinking={"type": "enabled", "budget_tokens": 2048},
+                    tools=[_WEATHER_TOOL],
+                    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+                    stop_sequences=["END"],
+                )
+        mock_aresponses.assert_not_awaited()
+
+
+def test_responses_stream_refusal_maps_to_text_and_stop_reason() -> None:
+    """Streamed refusal text reaches the client and the message ends with stop_reason=refusal."""
+    created = Response(
+        id="resp-refusal",
+        created_at=0,
+        model="gpt-5.6",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+    )
+    message = ResponseOutputMessage(id="msg-1", type="message", role="assistant", status="in_progress", content=[])
+    stream = [
+        ResponseCreatedEvent(type="response.created", sequence_number=0, response=created),
+        ResponseOutputItemAddedEvent(
+            type="response.output_item.added", sequence_number=1, output_index=0, item=message
+        ),
+        ResponseRefusalDeltaEvent(
+            type="response.refusal.delta",
+            sequence_number=2,
+            item_id="msg-1",
+            output_index=0,
+            content_index=0,
+            delta="I can't help with that.",
+        ),
+        ResponseCompletedEvent(
+            type="response.completed",
+            sequence_number=3,
+            response=created.model_copy(update={"status": "completed"}),
+        ),
+    ]
+
+    state = ResponsesStreamingState()
+    events = [e for event in stream for e in response_stream_event_to_message_events(event, state)]
+
+    deltas = [e for e in events if isinstance(e, ContentBlockDeltaEvent)]
+    assert [d.delta.text for d in deltas if isinstance(d.delta, TextDelta)] == ["I can't help with that."]
+    message_delta = next(e for e in events if isinstance(e, MessageDeltaEvent))
+    assert message_delta.delta.stop_reason == "refusal"
+
+
+@pytest.mark.parametrize("failure", ["response.failed", "error"])
+def test_responses_stream_failure_raises(failure: str) -> None:
+    """A failed Responses stream must surface as an error, not end the Messages stream quietly."""
+    created = Response(
+        id="resp-failed",
+        created_at=0,
+        model="gpt-5.6",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+    )
+    if failure == "response.failed":
+        failed = created.model_copy(
+            update={"status": "failed", "error": ResponseError(code="server_error", message="boom")}
+        )
+        event: Any = ResponseFailedEvent(type="response.failed", sequence_number=1, response=failed)
+    else:
+        event = ResponseErrorEvent(type="error", sequence_number=1, code="server_error", message="boom", param=None)
+
+    state = ResponsesStreamingState()
+    response_stream_event_to_message_events(
+        ResponseCreatedEvent(type="response.created", sequence_number=0, response=created), state
+    )
+    with pytest.raises(ProviderError, match="server_error: boom"):
+        response_stream_event_to_message_events(event, state)
+
+
+@pytest.mark.asyncio
+async def test_amessages_tools_and_thinking_keeps_completions_without_opt_in() -> None:
+    """Other Responses-capable OpenAI-compatible providers keep the Completions bridge for tools + thinking."""
+    completion = ChatCompletion(
+        id="chatcmpl-1",
+        created=0,
+        model="some-model",
+        object="chat.completion",
+        choices=[Choice(index=0, finish_reason="stop", message=ChatCompletionMessage(role="assistant", content="ok"))],
+    )
+    assert OpenrouterProvider.SUPPORTS_RESPONSES
+    with patch.object(OpenrouterProvider, "_init_client"):
+        provider = OpenrouterProvider(api_key="test-key")
+        mock_aresponses = AsyncMock()
+        mock_acompletion = AsyncMock(return_value=completion)
+        with (
+            patch.object(OpenrouterProvider, "_aresponses", mock_aresponses),
+            patch.object(OpenrouterProvider, "_acompletion", mock_acompletion),
+        ):
+            await provider.amessages(
+                model="some-model",
+                max_tokens=128,
+                thinking={"type": "enabled", "budget_tokens": 2048},
+                tools=[_WEATHER_TOOL],
+                messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+            )
+    mock_acompletion.assert_awaited_once()
+    mock_aresponses.assert_not_called()
+
+
+def test_messages_params_to_responses_params_documents() -> None:
+    """A tool result's URL document goes as file_url; a base64 document stays inline as file_data."""
+    params = MessagesParams(
+        model="gpt-5.6",
+        max_tokens=128,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_docs",
+                        "content": [
+                            {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}},
+                            {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="},
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        tools=[_WEATHER_TOOL],
+        thinking={"type": "enabled", "budget_tokens": 2048},
+    )
+    converted = messages_params_to_responses_params(params)
+    assert isinstance(converted.input, list)
+    parts = converted.input[1]["content"]
+    assert parts == [
+        {"type": "input_file", "file_url": "https://example.com/a.pdf"},
+        {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0="},
+    ]
+
+
+def test_response_to_message_response_separates_summary_parts() -> None:
+    response = _make_responses_result_with_tool_call()
+    reasoning = ResponseReasoningItem(
+        id="rs-1",
+        type="reasoning",
+        summary=[Summary(type="summary_text", text="Plan A."), Summary(type="summary_text", text="Then B.")],
+    )
+    converted = response_to_message_response(response.model_copy(update={"output": [reasoning]}))
+    assert converted.content == [ThinkingBlock(type="thinking", thinking="Plan A.\n\nThen B.")]
+
+
+def test_response_to_message_response_prefers_reasoning_text_over_summary() -> None:
+    response = _make_responses_result_with_tool_call()
+    reasoning = ResponseReasoningItem(
+        id="rs-1",
+        type="reasoning",
+        summary=[Summary(type="summary_text", text="short")],
+        content=[Content(type="reasoning_text", text="full reasoning")],
+    )
+    converted = response_to_message_response(response.model_copy(update={"output": [reasoning]}))
+    assert converted.content == [ThinkingBlock(type="thinking", thinking="full reasoning")]
+
+
+def test_response_to_message_response_splits_cached_tokens() -> None:
+    """Cached and cache-write tokens are subsets of OpenAI's input_tokens but disjoint in Messages usage."""
+    response = _make_responses_result_with_tool_call()
+    usage = ResponseUsage(
+        input_tokens=100,
+        output_tokens=5,
+        total_tokens=105,
+        input_tokens_details=InputTokensDetails(cached_tokens=60, cache_write_tokens=30),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=2),
+    )
+    converted = response_to_message_response(response.model_copy(update={"usage": usage}))
+    assert converted.usage.input_tokens == 10
+    assert converted.usage.cache_read_input_tokens == 60
+    assert converted.usage.cache_creation_input_tokens == 30
+    assert converted.usage.output_tokens == 5
+
+
+def _created_response(response_id: str) -> Response:
+    return Response(
+        id=response_id,
+        created_at=0,
+        model="gpt-5.6",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+    )
+
+
+def test_responses_stream_separates_summary_parts_and_splits_cached_tokens() -> None:
+    created = _created_response("resp-parts")
+    reasoning = ResponseReasoningItem(id="rs-1", type="reasoning", summary=[])
+    usage = ResponseUsage(
+        input_tokens=100,
+        output_tokens=5,
+        total_tokens=105,
+        input_tokens_details=InputTokensDetails(cached_tokens=80, cache_write_tokens=0),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=2),
+    )
+    stream: list[Any] = [
+        ResponseCreatedEvent(type="response.created", sequence_number=0, response=created),
+        ResponseOutputItemAddedEvent(
+            type="response.output_item.added", sequence_number=1, output_index=0, item=reasoning
+        ),
+    ]
+    for summary_index, text in enumerate(["Plan A.", "Then B."]):
+        stream.append(
+            ResponseReasoningSummaryPartAddedEvent(
+                type="response.reasoning_summary_part.added",
+                sequence_number=2,
+                item_id="rs-1",
+                output_index=0,
+                summary_index=summary_index,
+                part=Part(type="summary_text", text=""),
+            )
+        )
+        stream.append(
+            ResponseReasoningSummaryTextDeltaEvent(
+                type="response.reasoning_summary_text.delta",
+                sequence_number=3,
+                item_id="rs-1",
+                output_index=0,
+                summary_index=summary_index,
+                delta=text,
+            )
+        )
+    stream.append(
+        ResponseCompletedEvent(
+            type="response.completed",
+            sequence_number=4,
+            response=created.model_copy(update={"status": "completed", "usage": usage}),
+        )
+    )
+
+    state = ResponsesStreamingState()
+    events = [e for event in stream for e in response_stream_event_to_message_events(event, state)]
+
+    thinking = "".join(
+        e.delta.thinking for e in events if isinstance(e, ContentBlockDeltaEvent) and isinstance(e.delta, ThinkingDelta)
+    )
+    assert thinking == "Plan A.\n\nThen B."
+    message_delta = next(e for e in events if isinstance(e, MessageDeltaEvent))
+    assert message_delta.usage.input_tokens == 20
+    assert message_delta.usage.cache_read_input_tokens == 80
+    assert message_delta.usage.cache_creation_input_tokens == 0
+
+
+async def _collect_into(stream: AsyncIterator[Any], events: list[Any]) -> None:
+    async for event in stream:
+        events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_convert_responses_stream_reports_usage_before_failure() -> None:
+    """A failed stream still reports the tokens it spent, with no stop_reason and no message_stop."""
+    created = _created_response("resp-failed")
+    usage = ResponseUsage(
+        input_tokens=40,
+        output_tokens=7,
+        total_tokens=47,
+        input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=7),
+    )
+    failed = created.model_copy(
+        update={"status": "failed", "usage": usage, "error": ResponseError(code="server_error", message="boom")}
+    )
+
+    async def failing_stream() -> AsyncIterator[Any]:
+        yield ResponseCreatedEvent(type="response.created", sequence_number=0, response=created)
+        yield ResponseFailedEvent(type="response.failed", sequence_number=1, response=failed)
+
+    events: list[Any] = []
+    with pytest.raises(ProviderError, match="server_error: boom"):
+        await _collect_into(convert_responses_stream(failing_stream()), events)
+
+    assert isinstance(events[-1], MessageDeltaEvent)
+    assert events[-1].delta.stop_reason is None
+    assert events[-1].usage.input_tokens == 40
+    assert events[-1].usage.output_tokens == 7
+    assert not any(isinstance(e, MessageStopEvent) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_convert_responses_stream_reraises_without_usage_before_start() -> None:
+    async def failing_stream() -> AsyncIterator[Any]:
+        msg = "connection reset"
+        raise RuntimeError(msg)
+        yield  # pragma: no cover
+
+    events: list[Any] = []
+    with pytest.raises(RuntimeError, match="connection reset"):
+        await _collect_into(convert_responses_stream(failing_stream()), events)
+    assert events == []
+
+
+def test_messages_params_to_responses_params_maps_request_fields() -> None:
+    params = MessagesParams(
+        model="gpt-5.6",
+        max_tokens=128,
+        system="Be brief.",
+        temperature=0.5,
+        top_p=0.9,
+        prompt_cache_key="cache-key",
+        service_tier="auto",
+        tools=[_WEATHER_TOOL],
+        tool_choice={"type": "tool", "name": "get_weather", "disable_parallel_tool_use": True},
+        thinking={"type": "enabled", "budget_tokens": 2048},
+        messages=[
+            {"role": "user", "content": "Weather?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "need weather", "signature": ""},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "Sunny"},
+                    {"type": "text", "text": "And this?"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                    {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}},
+                ],
+            },
+        ],
+    )
+    converted = messages_params_to_responses_params(params)
+
+    assert converted.instructions == "Be brief."
+    assert converted.temperature == 0.5
+    assert converted.top_p == 0.9
+    assert converted.prompt_cache_key == "cache-key"
+    assert converted.service_tier == "auto"
+    assert converted.tool_choice == {"type": "function", "name": "get_weather"}
+    assert converted.parallel_tool_calls is False
+    assert converted.input == [
+        {"role": "user", "content": "Weather?"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "need weather"}]},
+        {"role": "assistant", "content": "Checking."},
+        {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Paris"}'},
+        {"type": "function_call_output", "call_id": "call_1", "output": "Sunny"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "And this?"},
+                {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "auto"},
+                {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}},
+            ],
+        },
+    ]
+
+
+def test_messages_params_to_responses_params_passes_structured_output_type() -> None:
+    class Weather(BaseModel):
+        city: str
+
+    params = MessagesParams(
+        model="gpt-5.6",
+        max_tokens=128,
+        messages=[{"role": "user", "content": "Weather?"}],
+        tools=[_WEATHER_TOOL],
+        tool_choice={"type": "auto"},
+        thinking={"type": "enabled", "budget_tokens": 2048},
+        output_format=Weather,
+    )
+    converted = messages_params_to_responses_params(params)
+    assert converted.response_format is Weather
+    assert converted.tool_choice == "auto"
+    assert converted.parallel_tool_calls is None
+
+
+def test_response_to_message_response_text_refusal_and_bad_arguments() -> None:
+    response = {
+        "id": "resp-1",
+        "model": "gpt-5.6",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hi"}, {"type": "refusal", "refusal": "No"}],
+            },
+            {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{not json"},
+            {"type": "function_call", "id": "fc_2", "name": "get_weather", "arguments": "[1]"},
+        ],
+    }
+    converted = response_to_message_response(response)
+    assert converted.content == [
+        TextBlock(type="text", text="Hi"),
+        TextBlock(type="text", text="No"),
+        ToolUseBlock(type="tool_use", id="call_1", name="get_weather", input={}),
+        ToolUseBlock(type="tool_use", id="fc_2", name="get_weather", input={}),
+    ]
+    assert converted.stop_reason == "tool_use"
+    assert converted.usage.input_tokens == 0
+
+
+def test_response_to_message_response_incomplete_without_output() -> None:
+    converted = response_to_message_response({"id": "resp-1", "model": "gpt-5.6", "status": "incomplete", "output": []})
+    assert converted.content == [TextBlock(type="text", text="")]
+    assert converted.stop_reason == "max_tokens"
+
+
+def test_responses_stream_text_tool_arguments_and_incomplete() -> None:
+    """A stream without response.created still opens the message, and incomplete ends it as max_tokens."""
+    stream: list[dict[str, Any]] = [
+        {"type": "response.in_progress"},
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "msg-1"}},
+        {"type": "response.output_text.delta", "item_id": "msg-1", "delta": "Hi"},
+        {"type": "response.output_text.delta", "item_id": "msg-1", "delta": ""},
+        {"type": "response.output_text.delta", "item_id": "unknown", "delta": "lost"},
+        {"type": "response.output_item.done", "item": {"type": "message", "id": "msg-1"}},
+        {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}},
+        {"type": "response.reasoning_summary_part.added", "item_id": "unknown", "summary_index": 1},
+        {"type": "response.reasoning_text.delta", "item_id": "unknown", "delta": "lost"},
+        {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": ""},
+        {"type": "response.output_item.added", "item": {"type": "web_search_call", "id": "ws-1"}},
+        {"type": "response.function_call_arguments.delta", "item_id": "unknown", "delta": "{}"},
+        {"type": "response.incomplete", "response": {"usage": None}},
+    ]
+    state = ResponsesStreamingState()
+    events = [e for event in stream for e in response_stream_event_to_message_events(event, state)]
+
+    assert isinstance(events[0], MessageStartEvent)
+    assert events[0].message.id == "msg_stream"
+    assert [
+        e.delta.text for e in events if isinstance(e, ContentBlockDeltaEvent) and isinstance(e.delta, TextDelta)
+    ] == ["Hi"]
+    message_delta = next(e for e in events if isinstance(e, MessageDeltaEvent))
+    assert message_delta.delta.stop_reason == "max_tokens"
+    assert isinstance(events[-1], MessageStopEvent)
+
+
+def test_responses_stream_function_call_arguments() -> None:
+    stream: list[dict[str, Any]] = [
+        {"type": "response.created", "response": {"id": "resp-1", "model": "gpt-5.6"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "fc-1", "call_id": "call_1", "name": "get_weather"},
+        },
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-1", "delta": '{"city":'},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-1", "delta": ""},
+        {"type": "response.completed", "response": {"usage": None}},
+    ]
+    state = ResponsesStreamingState()
+    events = [e for event in stream for e in response_stream_event_to_message_events(event, state)]
+
+    deltas = [e.delta for e in events if isinstance(e, ContentBlockDeltaEvent)]
+    assert deltas == [InputJSONDelta(type="input_json_delta", partial_json='{"city":')]
+    message_delta = next(e for e in events if isinstance(e, MessageDeltaEvent))
+    assert message_delta.delta.stop_reason == "tool_use"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"container": "container-1"}, "container"),
+        ({"betas": ["some-beta"]}, "betas"),
+    ],
+)
+async def test_amessages_tools_and_thinking_rejects_native_only_params(extra: dict[str, Any], match: str) -> None:
+    with patch.object(OpenaiProvider, "_init_client"):
+        provider = OpenaiProvider(api_key="test-key")
+        mock_aresponses = AsyncMock()
+        with (
+            patch.object(OpenaiProvider, "_aresponses", mock_aresponses),
+            pytest.raises(NotImplementedError, match=match),
+        ):
+            await provider.amessages(
+                model="gpt-5.6",
+                max_tokens=128,
+                thinking={"type": "enabled", "budget_tokens": 2048},
+                tools=[_WEATHER_TOOL],
+                messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+                **extra,
+            )
+        mock_aresponses.assert_not_awaited()
+
+
+def _multipart_file_part(request: httpx.Request) -> tuple[str | None, str, bytes]:
+    """Return the ``file`` part of a multipart request as ``(filename, content_type, payload)``."""
+    raw = b"Content-Type: " + request.headers["content-type"].encode() + b"\r\n\r\n" + request.content
+    message = email.message_from_bytes(raw)
+    for part in message.get_payload():
+        assert isinstance(part, email.message.Message)
+        if part.get_param("name", header="content-disposition") == "file":
+            payload = part.get_payload(decode=True)
+            assert isinstance(payload, bytes)
+            return part.get_filename(), part.get_content_type(), payload
+    msg = "no file part in request"
+    raise AssertionError(msg)
+
+
+def _transcription_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(request)
+        return httpx.Response(200, json={"text": "Hi Octonous, what is on my calendar tomorrow?"})
+
+    return httpx.MockTransport(handler), requests
+
+
+@pytest.mark.asyncio
+async def test_transcription_uploads_named_bytesio_with_its_name_and_content_type() -> None:
+    """A named in-memory file reaches the wire as a file part with that name, as if read from disk."""
+    transport, requests = _transcription_transport()
+    audio = b"\x00\x00\x00\x1cftypM4A " + b"\x00" * 24
+    stream = io.BytesIO(audio)
+    stream.name = "audio_message.m4a"
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    try:
+        result = await provider.atranscription("whisper-1", stream, language="en")
+    finally:
+        await provider.client.close()
+
+    assert result.text == "Hi Octonous, what is on my calendar tomorrow?"
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/audio/transcriptions"
+    assert _multipart_file_part(requests[0]) == ("audio_message.m4a", "audio/mp4", audio)
+    assert b'name="language"\r\n\r\nen\r\n' in requests[0].content
+
+
+@pytest.mark.asyncio
+async def test_transcription_uploads_bare_bytes_under_a_name_derived_from_their_container() -> None:
+    """Bare bytes no longer go out as an octet-stream named ``upload``, which OpenAI rejects."""
+    transport, requests = _transcription_transport()
+    audio = b"\x1a\x45\xdf\xa3" + b"\x00" * 28
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    try:
+        await provider.atranscription("whisper-1", audio)
+    finally:
+        await provider.client.close()
+
+    assert _multipart_file_part(requests[0]) == ("audio.webm", "audio/webm", audio)
+
+
+@pytest.mark.asyncio
+async def test_transcription_uploads_bytes_under_an_explicit_filename_and_mime_type() -> None:
+    transport, requests = _transcription_transport()
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    try:
+        await provider.atranscription("whisper-1", b"opaque", filename="clip.mp3", mime_type="audio/mpeg")
+    finally:
+        await provider.client.close()
+
+    assert _multipart_file_part(requests[0]) == ("clip.mp3", "audio/mpeg", b"opaque")
+
+
+@pytest.mark.asyncio
+async def test_transcription_uploads_a_path_under_its_file_name(tmp_path: pathlib.Path) -> None:
+    transport, requests = _transcription_transport()
+    clip = tmp_path / "voice.ogg"
+    clip.write_bytes(b"OggS" + b"\x00" * 28)
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    try:
+        await provider.atranscription("whisper-1", clip)
+    finally:
+        await provider.client.close()
+
+    assert _multipart_file_part(requests[0]) == ("voice.ogg", "audio/ogg", clip.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_transcription_missing_path_raises_before_any_request(tmp_path: pathlib.Path) -> None:
+    transport, requests = _transcription_transport()
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    try:
+        with pytest.raises(InvalidRequestError, match="Cannot read audio path"):
+            await provider.atranscription("whisper-1", tmp_path / "missing.m4a")
+    finally:
+        await provider.client.close()
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_format", ["text", "srt", "vtt"])
+async def test_transcription_wraps_text_formats_in_a_transcription(
+    response_format: Literal["text", "srt", "vtt"],
+) -> None:
+    """The SDK hands back the raw body for text formats; callers always get a Transcription."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/plain; charset=utf-8"}, text="hello there\n")
+
+    provider = OpenaiProvider(api_key="key", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        result = await provider.atranscription("whisper-1", b"ID3" + b"\x00" * 29, response_format=response_format)
+    finally:
+        await provider.client.close()
+
+    assert isinstance(result, Transcription)
+    assert result.text == "hello there\n"
+    assert f'name="response_format"\r\n\r\n{response_format}\r\n'.encode() in requests[0].content

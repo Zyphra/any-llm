@@ -58,6 +58,11 @@ def build_summary() -> str:
 * [Introduction](index.md)
 * [Quickstart](quickstart.md)
 * [Providers](providers.md)
+* [Files](files.md)
+* [Decide](decide.md)
+* [Video Generation](video.md)
+* [TypeSafe](typesafe.md)
+* [Prompt Caching](caching.md)
 
 ## Cookbooks
 
@@ -69,6 +74,8 @@ def build_summary() -> str:
 * [Responses](api/responses.md)
 * [Completion](api/completion.md)
 * [Embedding](api/embedding.md)
+* [Decide](api/decide.md)
+* [Video](api/video.md)
 * [Messages](api/messages.md)
 * [Exceptions](api/exceptions.md)
 * [List Models](api/list-models.md)
@@ -80,6 +87,8 @@ def build_summary() -> str:
   * [Model](api/types/model.md)
   * [Provider](api/types/provider.md)
   * [Batch](api/types/batch.md)
+  * [Decide](api/types/decide.md)
+  * [Video](api/types/video.md)
 
 """
 

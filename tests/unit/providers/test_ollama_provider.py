@@ -1,8 +1,12 @@
+import json
 import logging
-from collections.abc import AsyncIterator
+import os
+import time
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
 from ollama import ChatResponse as OllamaChatResponse
 from ollama import Message as OllamaMessage
@@ -12,7 +16,7 @@ from any_llm.providers.ollama.utils import (
     _create_chat_completion_from_ollama_response,
     _create_openai_chunk_from_ollama_chunk,
 )
-from any_llm.types.completion import CompletionParams
+from any_llm.types.completion import ChatCompletion, CompletionParams
 
 
 @pytest.mark.asyncio
@@ -143,6 +147,137 @@ async def test_create_chat_completion_extracts_think_content() -> None:
     assert result.choices[0].message.content == "This is the actual response"
     assert result.usage is not None
     assert result.usage.model_extra == {}
+
+
+@pytest.mark.asyncio
+async def test_think_extraction_preserves_content_before_the_tag() -> None:
+    mock_message = Mock(spec=OllamaMessage)
+    mock_message.content = "Preamble text. <think>my reasoning</think>The answer"
+    mock_message.thinking = None
+    mock_message.tool_calls = None
+    mock_message.role = "assistant"
+
+    mock_response = Mock(spec=OllamaChatResponse)
+    mock_response.message = mock_message
+    mock_response.created_at = "2024-01-01T12:00:00.000000Z"
+    mock_response.prompt_eval_count = 10
+    mock_response.eval_count = 20
+    mock_response.model = "llama3.1"
+    mock_response.done_reason = "stop"
+    mock_response.total_duration = None
+    mock_response.load_duration = None
+    mock_response.prompt_eval_duration = None
+    mock_response.eval_duration = None
+
+    result = _create_chat_completion_from_ollama_response(mock_response)
+
+    assert result.choices[0].message.reasoning is not None
+    assert result.choices[0].message.reasoning.content == "my reasoning"
+    assert result.choices[0].message.content == "Preamble text. The answer"
+
+
+@pytest.mark.asyncio
+async def test_think_extraction_handles_multiple_tagged_blocks() -> None:
+    mock_message = Mock(spec=OllamaMessage)
+    mock_message.content = "<think>first</think>middle<think>second</think>end"
+    mock_message.thinking = None
+    mock_message.tool_calls = None
+    mock_message.role = "assistant"
+
+    mock_response = Mock(spec=OllamaChatResponse)
+    mock_response.message = mock_message
+    mock_response.created_at = "2024-01-01T12:00:00.000000Z"
+    mock_response.prompt_eval_count = 10
+    mock_response.eval_count = 20
+    mock_response.model = "llama3.1"
+    mock_response.done_reason = "stop"
+    mock_response.total_duration = None
+    mock_response.load_duration = None
+    mock_response.prompt_eval_duration = None
+    mock_response.eval_duration = None
+
+    result = _create_chat_completion_from_ollama_response(mock_response)
+
+    assert result.choices[0].message.reasoning is not None
+    assert result.choices[0].message.reasoning.content == "first\nsecond"
+    assert result.choices[0].message.content == "middleend"
+    assert "<think>" not in (result.choices[0].message.content or "")
+
+
+@pytest.mark.asyncio
+async def test_think_extraction_handles_alternate_tag_names() -> None:
+    mock_message = Mock(spec=OllamaMessage)
+    mock_message.content = "<thinking>alt tag reasoning</thinking>The answer"
+    mock_message.thinking = None
+    mock_message.tool_calls = None
+    mock_message.role = "assistant"
+
+    mock_response = Mock(spec=OllamaChatResponse)
+    mock_response.message = mock_message
+    mock_response.created_at = "2024-01-01T12:00:00.000000Z"
+    mock_response.prompt_eval_count = 10
+    mock_response.eval_count = 20
+    mock_response.model = "llama3.1"
+    mock_response.done_reason = "stop"
+    mock_response.total_duration = None
+    mock_response.load_duration = None
+    mock_response.prompt_eval_duration = None
+    mock_response.eval_duration = None
+
+    result = _create_chat_completion_from_ollama_response(mock_response)
+
+    assert result.choices[0].message.reasoning is not None
+    assert result.choices[0].message.reasoning.content == "alt tag reasoning"
+    assert result.choices[0].message.content == "The answer"
+
+
+@pytest.mark.asyncio
+async def test_think_extraction_leaves_no_reasoning_for_an_empty_block() -> None:
+    """An empty block is still a block: the tags have to come off the content, but an empty
+    string is not reasoning, so the field stays None rather than carrying "".
+    """
+    mock_message = Mock(spec=OllamaMessage)
+    mock_message.content = "<think></think>The answer"
+    mock_message.thinking = None
+    mock_message.tool_calls = None
+    mock_message.role = "assistant"
+
+    mock_response = Mock(spec=OllamaChatResponse)
+    mock_response.message = mock_message
+    mock_response.created_at = "2024-01-01T12:00:00.000000Z"
+    mock_response.prompt_eval_count = 10
+    mock_response.eval_count = 20
+    mock_response.model = "llama3.1"
+    mock_response.done_reason = "stop"
+    mock_response.total_duration = None
+    mock_response.load_duration = None
+    mock_response.prompt_eval_duration = None
+    mock_response.eval_duration = None
+
+    result = _create_chat_completion_from_ollama_response(mock_response)
+
+    assert result.choices[0].message.reasoning is None
+    assert result.choices[0].message.content == "The answer"
+
+
+@pytest.mark.parametrize("native_thinking", [None, "native reasoning"])
+def test_think_extraction_keeps_mixed_tags_in_textual_order(native_thinking: str | None) -> None:
+    content = "<think>first</think>middle<thinking>second</thinking>end"
+    response = OllamaChatResponse(
+        model="llama3.1",
+        created_at="2024-01-01T12:00:00.000000Z",
+        message=OllamaMessage(role="assistant", content=content, thinking=native_thinking),
+        done_reason="stop",
+        prompt_eval_count=10,
+        eval_count=20,
+    )
+
+    result = _create_chat_completion_from_ollama_response(response)
+
+    message = result.choices[0].message
+    assert message.reasoning is not None
+    assert message.reasoning.content == (native_thinking or "first\nsecond")
+    assert message.content == (content if native_thinking else "middleend")
 
 
 def test_create_chat_completion_preserves_timing_details() -> None:
@@ -458,6 +593,7 @@ async def test_streaming_assigns_distinct_tool_call_indices() -> None:
         chunk.message = message
         chunk.created_at = None
         chunk.model = "llama3.1"
+        chunk.done = False
         chunk.done_reason = None
         chunk.prompt_eval_count = None
         chunk.eval_count = None
@@ -780,3 +916,256 @@ async def test_tool_call_arguments_are_converted_to_a_mapping(arguments: Any, ex
     )
 
     assert sent[1]["tool_calls"] == [{"function": {"name": "get_weather", "arguments": expected}}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("reason_fields", "expected"),
+    [
+        ({}, "stop"),
+        ({"done_reason": None}, "stop"),
+        ({"done_reason": "load"}, "stop"),
+        ({"done_reason": "unload"}, "stop"),
+        ({"done_reason": "stop"}, "stop"),
+        ({"done_reason": "length"}, "length"),
+        ({"done_reason": "future_reason"}, "stop"),
+        ({"done_reason": "tool_calls"}, "tool_calls"),
+        ({"done_reason": "content_filter"}, "content_filter"),
+        ({"done_reason": "function_call"}, "function_call"),
+    ],
+)
+async def test_completion_normalizes_sdk_done_reason(
+    stream: bool, reason_fields: dict[str, str | None], expected: str
+) -> None:
+    """Exercise JSON and NDJSON decoding through the real Ollama SDK and provider."""
+    terminal = {
+        "model": "llama3.2",
+        "created_at": "2024-09-12T21:17:29.110811Z",
+        "message": {"role": "assistant", "content": ""},
+        "done": True,
+        **reason_fields,
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/chat"
+        assert json.loads(request.content)["stream"] is stream
+        if stream:
+            partial = {**terminal, "done": False, "message": {"role": "assistant", "content": "Hello"}}
+            partial.pop("done_reason", None)
+            return httpx.Response(
+                200,
+                content="\n".join(json.dumps(item) for item in [partial, terminal]) + "\n",
+                headers={"content-type": "application/x-ndjson"},
+            )
+        return httpx.Response(200, json=terminal)
+
+    provider = OllamaProvider(api_base="http://ollama.test", transport=httpx.MockTransport(handle))
+    try:
+        result = await provider.acompletion(
+            model="llama3.2", messages=[{"role": "user", "content": "Hello"}], stream=stream
+        )
+        if stream:
+            assert isinstance(result, AsyncIterator)
+            chunks = [chunk async for chunk in result]
+            assert len(chunks) == 2
+            assert chunks[0].choices[0].delta.content == "Hello"
+            assert chunks[0].choices[0].finish_reason is None
+            assert chunks[1].choices[0].delta.content == ""
+            assert chunks[1].choices[0].finish_reason == expected
+        else:
+            assert isinstance(result, ChatCompletion)
+            assert result.choices[0].message.content == ""
+            assert result.choices[0].finish_reason == expected
+    finally:
+        await provider.client._client.aclose()
+
+
+@pytest.mark.parametrize("done_reason", [None, "load", "unload", "stop", "length"])
+def test_completion_normalization_preserves_tool_call_precedence(done_reason: str | None) -> None:
+    response = OllamaChatResponse(
+        model="llama3.2",
+        created_at="2024-09-12T21:17:29.110811Z",
+        done=True,
+        done_reason=done_reason,
+        message=OllamaMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                OllamaMessage.ToolCall(
+                    function=OllamaMessage.ToolCall.Function(name="get_weather", arguments={"city": "Paris"})
+                )
+            ],
+        ),
+    )
+    completion = _create_chat_completion_from_ollama_response(response)
+    assert completion.choices[0].finish_reason == "tool_calls"
+    calls = completion.choices[0].message.tool_calls
+    assert calls is not None
+    assert calls[0].type == "function"
+    assert calls[0].function.name == "get_weather"
+    assert json.loads(calls[0].function.arguments) == {"city": "Paris"}
+
+
+def test_convert_completion_params_omits_num_ctx_when_unset() -> None:
+    params = CompletionParams(
+        model_id="llama3.1",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    converted = OllamaProvider._convert_completion_params(params)
+    assert "num_ctx" not in converted
+
+
+def test_convert_completion_params_omits_explicit_none_num_ctx() -> None:
+    params = CompletionParams(
+        model_id="llama3.1",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    converted = OllamaProvider._convert_completion_params(params, num_ctx=None)
+    assert "num_ctx" not in converted
+
+
+def test_convert_completion_params_keeps_explicit_num_ctx() -> None:
+    params = CompletionParams(
+        model_id="llama3.1",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    converted = OllamaProvider._convert_completion_params(params, num_ctx=8192)
+    assert converted["num_ctx"] == 8192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_completion_omits_num_ctx_when_unset(stream: bool) -> None:
+    async def empty_async_iter() -> AsyncIterator[None]:
+        return
+        yield
+
+    params = CompletionParams(
+        model_id="llama3.1",
+        messages=[{"role": "user", "content": "Hello"}],
+        stream=stream,
+    )
+
+    with patch.object(OllamaProvider, "_init_client"):
+        provider = OllamaProvider(api_key=None)
+        provider.client = Mock()
+        provider.client.chat = AsyncMock(return_value=empty_async_iter() if stream else Mock())
+
+        if stream:
+            result = await provider._acompletion(params)
+            async for _ in result:  # type: ignore[union-attr]
+                pass
+        else:
+            with patch.object(OllamaProvider, "_convert_completion_response", return_value=Mock()):
+                await provider._acompletion(params)
+
+        options = provider.client.chat.call_args.kwargs["options"]
+
+    assert "num_ctx" not in options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_completion_passes_explicit_num_ctx(stream: bool) -> None:
+    async def empty_async_iter() -> AsyncIterator[None]:
+        return
+        yield
+
+    params = CompletionParams(
+        model_id="llama3.1",
+        messages=[{"role": "user", "content": "Hello"}],
+        stream=stream,
+    )
+
+    with patch.object(OllamaProvider, "_init_client"):
+        provider = OllamaProvider(api_key=None)
+        provider.client = Mock()
+        provider.client.chat = AsyncMock(return_value=empty_async_iter() if stream else Mock())
+
+        if stream:
+            result = await provider._acompletion(params, num_ctx=4096)
+            async for _ in result:  # type: ignore[union-attr]
+                pass
+        else:
+            with patch.object(OllamaProvider, "_convert_completion_response", return_value=Mock()):
+                await provider._acompletion(params, num_ctx=4096)
+
+        options = provider.client.chat.call_args.kwargs["options"]
+
+    assert options["num_ctx"] == 4096
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        "2024-01-01T12:00:00Z",
+        "2024-01-01T12:00:00.123456789Z",
+        "2024-01-01T14:00:00+02:00",
+        "2024-01-01T14:00:00.123456789+02:00",
+        "2024-01-01T06:30:00.123456-05:30",
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_ollama_created_at_accepts_rfc3339_timestamps(created_at: str, stream: bool) -> None:
+    response = OllamaChatResponse(
+        model="llama3.1",
+        created_at=created_at,
+        message=OllamaMessage(role="assistant", content="Hello"),
+        done=True,
+        done_reason="stop",
+    )
+    result = (
+        _create_openai_chunk_from_ollama_chunk(response)
+        if stream
+        else _create_chat_completion_from_ollama_response(response)
+    )
+    assert result.created == 1704110400
+
+
+@pytest.fixture
+def non_utc_local_timezone() -> Iterator[None]:
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is unavailable on this platform")
+    original = os.environ.get("TZ")
+    # A POSIX rule string needs no tz database on the host.
+    os.environ["TZ"] = "EST+05"
+    time.tzset()
+    yield
+    if original is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
+
+
+@pytest.mark.usefixtures("non_utc_local_timezone")
+@pytest.mark.parametrize("stream", [False, True])
+def test_ollama_created_at_without_offset_is_read_as_utc(stream: bool) -> None:
+    response = OllamaChatResponse(
+        model="llama3.1",
+        created_at="2024-01-01T12:00:00.123456",
+        message=OllamaMessage(role="assistant", content="Hello"),
+        done=True,
+        done_reason="stop",
+    )
+    result = (
+        _create_openai_chunk_from_ollama_chunk(response)
+        if stream
+        else _create_chat_completion_from_ollama_response(response)
+    )
+    assert result.created == 1704110400
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_ollama_created_at_invalid_raises(stream: bool) -> None:
+    response = OllamaChatResponse(
+        model="llama3.1",
+        created_at="not-a-timestamp",
+        message=OllamaMessage(role="assistant", content="Hello"),
+        done=True,
+        done_reason="stop",
+    )
+    converter = _create_openai_chunk_from_ollama_chunk if stream else _create_chat_completion_from_ollama_response
+    with pytest.raises(ValueError, match="Invalid isoformat string"):
+        converter(response)

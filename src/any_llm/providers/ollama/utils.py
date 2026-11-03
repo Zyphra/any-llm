@@ -27,6 +27,23 @@ from any_llm.types.completion import (
     Usage,
 )
 from any_llm.types.model import Model
+from any_llm.utils.reasoning import normalize_reasoning_from_provider_fields_and_xml_tags
+
+
+def _map_ollama_done_reason(
+    done_reason: str | None,
+) -> Literal["stop", "length", "tool_calls", "content_filter", "function_call"]:
+    """Normalize a terminal reason, using stop when Ollama has no OpenAI equivalent.
+
+    Ollama's load/unload responses complete a model lifecycle operation without
+    generating text. Missing and unknown reasons use the same stop fallback as
+    other providers; they do not imply truncation, filtering, or a tool call.
+    """
+    match done_reason:
+        case "stop" | "length" | "tool_calls" | "content_filter" | "function_call":
+            return done_reason
+        case _:
+            return "stop"
 
 
 def _convert_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -80,18 +97,21 @@ def _extract_ollama_timing_details(response: OllamaChatResponse) -> dict[str, in
     return {field: value for field, value in timing.items() if value is not None}
 
 
+def _ollama_timestamp_to_epoch(created_at: str) -> int:
+    """Convert an Ollama RFC 3339 ``created_at`` string to Unix seconds."""
+    parsed = datetime.fromisoformat(created_at)
+    if parsed.tzinfo is None:
+        # A naive datetime would otherwise be read in the host's local timezone.
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp())
+
+
 def _create_openai_chunk_from_ollama_chunk(ollama_chunk: OllamaChatResponse) -> ChatCompletionChunk:
     """Convert an Ollama streaming chunk to OpenAI ChatCompletionChunk format."""
 
     message = ollama_chunk.message
     created_str = ollama_chunk.created_at
-    created = 0
-    if created_str:
-        if "." in created_str and len(created_str.split(".")[1].rstrip("Z")) > 6:
-            parts = created_str.split(".")
-            microseconds = parts[1][:6]
-            created_str = f"{parts[0]}.{microseconds}Z"
-        created = int(datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp())
+    created = _ollama_timestamp_to_epoch(created_str) if created_str else 0
 
     content = message.content
 
@@ -130,9 +150,10 @@ def _create_openai_chunk_from_ollama_chunk(ollama_chunk: OllamaChatResponse) -> 
     choice = ChunkChoice(
         index=0,
         delta=delta,
-        finish_reason=cast(
-            "Literal['stop', 'length', 'tool_calls', 'content_filter', 'function_call'] | None",
-            ollama_chunk.done_reason,
+        finish_reason=(
+            _map_ollama_done_reason(ollama_chunk.done_reason)
+            if ollama_chunk.done or ollama_chunk.done_reason is not None
+            else None
         ),
     )
 
@@ -168,11 +189,7 @@ def _create_chat_completion_from_ollama_response(response: OllamaChatResponse) -
         msg = "Expected Ollama to provide a created_at timestamp"
         raise ValueError(msg)
 
-    if "." in created_str and len(created_str.split(".")[1].rstrip("Z")) > 6:
-        parts = created_str.split(".")
-        microseconds = parts[1][:6]
-        created_str = f"{parts[0]}.{microseconds}Z"
-    created = int(datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp())
+    created = _ollama_timestamp_to_epoch(created_str)
 
     prompt_tokens = response.prompt_eval_count or 0
     completion_tokens = response.eval_count or 0
@@ -205,10 +222,18 @@ def _create_chat_completion_from_ollama_response(response: OllamaChatResponse) -
                 )
             )
     if not response_message.thinking and response_message.content:
-        # If it didn't come out right from ollama, also look for it in the content between <think> and </think>
-        if "<think>" in response_message.content and "</think>" in response_message.content:
-            response_message.thinking = response_message.content.split("<think>")[1].split("</think>")[0]
-            response_message.content = response_message.content.split("</think>")[1]
+        # Ollama does not always route reasoning to its own thinking field, so fall back to the
+        # tags in content. Parsing is delegated to the shared normalizer so this provider keeps
+        # the same semantics as the others: every tagged block is collected, the surrounding
+        # content survives instead of being truncated to whatever follows the last closing tag,
+        # and the tag names stay in step with REASONING_FIELD_NAMES rather than being just <think>.
+        message_dict: dict[str, Any] = {"content": response_message.content}
+        normalize_reasoning_from_provider_fields_and_xml_tags(message_dict)
+        reasoning = message_dict.get("reasoning")
+        reasoning_text = reasoning.get("content") if isinstance(reasoning, dict) else None
+        if reasoning_text:
+            response_message.thinking = reasoning_text
+        response_message.content = message_dict["content"]
 
     message = ChatCompletionMessage(
         role="assistant",
@@ -217,7 +242,7 @@ def _create_chat_completion_from_ollama_response(response: OllamaChatResponse) -
         reasoning=Reasoning(content=response_message.thinking) if response_message.thinking else None,
     )
 
-    finish_reason: Any = "tool_calls" if openai_tool_calls else response.done_reason
+    finish_reason = "tool_calls" if openai_tool_calls else _map_ollama_done_reason(response.done_reason)
 
     choice = Choice(index=0, finish_reason=finish_reason, message=message)
 

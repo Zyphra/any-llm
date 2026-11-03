@@ -193,6 +193,136 @@ def test_patch_messages_rebuilds_thinking_and_still_inserts_assistant_ok() -> No
     assert out[2] == {"role": "assistant", "content": "OK"}
 
 
+@pytest.mark.parametrize(
+    "empty_assistant",
+    [
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": None},
+        {"role": "assistant"},
+        {"role": "assistant", "content": []},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}, {"type": "text"}]},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "assistant", "content": "", "tool_calls": None, "reasoning": ""},
+    ],
+)
+def test_patch_messages_drops_trailing_empty_assistant_message(empty_assistant: dict[str, Any]) -> None:
+    """Mistral rejects a conversation ending in an empty assistant turn, so it is dropped."""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        empty_assistant,
+    ]
+    out = _patch_messages(messages)
+    assert out == messages[:2]
+
+
+def test_patch_messages_drops_empty_assistant_message_mid_conversation() -> None:
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "u2"},
+    ]
+    out = _patch_messages(messages)
+    assert out == [{"role": "user", "content": "u1"}, {"role": "user", "content": "u2"}]
+
+
+@pytest.mark.parametrize(
+    "assistant",
+    [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}, {"type": "image_url", "image_url": "x"}]},
+        {"role": "assistant", "content": ["not-a-dict-part"]},
+        {"role": "assistant", "content": {"unexpected": "shape"}},
+    ],
+)
+def test_patch_messages_keeps_assistant_message_that_carries_something(assistant: dict[str, Any]) -> None:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "u"}, assistant]
+    out = _patch_messages(messages)
+    assert out == messages
+
+
+def test_patch_messages_keeps_reasoning_only_assistant_message() -> None:
+    """An assistant turn with only a reasoning trace is rebuilt into a thinking chunk, not dropped."""
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "", "reasoning": "thought hard"},
+    ]
+    out = _patch_messages(messages)
+    assert len(out) == 2
+    assert out[1]["content"] == [{"type": "thinking", "thinking": [{"type": "text", "text": "thought hard"}]}]
+
+
+def test_patch_messages_keeps_empty_content_on_non_assistant_roles() -> None:
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": ""},
+        {"role": "tool", "content": ""},
+    ]
+    out = _patch_messages(messages)
+    assert out == messages
+
+
+def test_patch_messages_inserts_assistant_ok_when_dropped_message_separated_tool_and_user() -> None:
+    """Dropping an empty assistant between a tool and user turn still yields the "OK" bridge."""
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "tool", "content": "t1"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "u1"},
+    ]
+    out = _patch_messages(messages)
+    assert out == [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "tool", "content": "t1"},
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "u1"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_completion_drops_trailing_empty_assistant_message(stream: bool) -> None:
+    """Both the completion and streaming paths send Mistral the filtered messages."""
+    pytest.importorskip("mistralai")
+    from any_llm.providers.mistral.mistral import MistralProvider
+
+    async def mock_stream(*args: Any, **kwargs: Any) -> Any:
+        async def async_iter() -> Any:
+            return
+            yield
+
+        return async_iter()
+
+    with (
+        patch("any_llm.providers.mistral.mistral.Mistral") as mocked_mistral,
+        patch("any_llm.providers.mistral.mistral._create_mistral_completion_from_response"),
+    ):
+        provider = MistralProvider(api_key="test-api-key")
+        mocked_mistral.return_value.chat.complete_async = AsyncMock(return_value=Mock())
+        mocked_mistral.return_value.chat.stream_async = AsyncMock(side_effect=mock_stream)
+
+        result = await provider._acompletion(
+            CompletionParams(
+                model_id="mistral-small-latest",
+                messages=[
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": ""},
+                ],
+                stream=stream,
+            ),
+        )
+
+        if stream:
+            async for _ in cast("AsyncIterator[Any]", result):
+                pass
+            call_kwargs = mocked_mistral.return_value.chat.stream_async.call_args[1]
+        else:
+            call_kwargs = mocked_mistral.return_value.chat.complete_async.call_args[1]
+
+        assert call_kwargs["messages"] == [{"role": "user", "content": "Hello"}]
+
+
 class StructuredOutput(BaseModel):
     foo: str
     bar: int
@@ -1163,6 +1293,8 @@ def test_create_mistral_completion_builds_chatcompletion_from_well_formed_respon
     unit coverage beyond the error path.
     """
     pytest.importorskip("mistralai")
+    from mistralai.client.models import UsageInfo
+
     from any_llm.providers.mistral.utils import _create_mistral_completion_from_response
 
     message = Mock()
@@ -1173,10 +1305,7 @@ def test_create_mistral_completion_builds_chatcompletion_from_well_formed_respon
     choice.message = message
     choice.finish_reason = "stop"
 
-    usage = Mock()
-    usage.prompt_tokens = 12
-    usage.completion_tokens = 7
-    usage.total_tokens = 19
+    usage = UsageInfo(prompt_tokens=12, completion_tokens=7, total_tokens=19)
 
     response = Mock()
     response.id = "chatcmpl-abc"
@@ -1445,3 +1574,129 @@ def test_timeout_absent_when_not_requested() -> None:
     )
 
     assert "timeout_ms" not in converted
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"),
+    [("error", "error"), ("model_length", "length"), ("stop", "stop")],
+)
+def test_create_mistral_completion_maps_finish_reason(finish_reason: str, expected: str) -> None:
+    """model_length becomes length; any other Mistral finish_reason reaches the caller as sent."""
+    pytest.importorskip("mistralai")
+    from any_llm.providers.mistral.utils import _create_mistral_completion_from_response
+
+    message = Mock()
+    message.content = "partial"
+    message.tool_calls = None
+
+    choice = Mock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+
+    response = Mock()
+    response.id = "chatcmpl-abc"
+    response.created = 1_700_000_000
+    response.choices = [choice]
+    response.usage = None
+
+    completion = _create_mistral_completion_from_response(response, model="mistral-small-latest")
+
+    assert completion.choices[0].finish_reason == expected
+    assert completion.choices[0].message.content == "partial"
+
+
+def test_create_openai_chunk_keeps_nonstandard_finish_reason() -> None:
+    """Mistral's streaming ``error`` finish_reason reaches the caller as sent."""
+    pytest.importorskip("mistralai")
+    from any_llm.providers.mistral.utils import _create_openai_chunk_from_mistral_chunk
+
+    choice = Mock()
+    choice.index = 0
+    choice.delta.content = "partial"
+    choice.delta.role = "assistant"
+    choice.delta.tool_calls = None
+    choice.finish_reason = "error"
+
+    event = Mock()
+    event.data.id = "chatcmpl-abc"
+    event.data.created = 1_700_000_000
+    event.data.model = "mistral-small-latest"
+    event.data.choices = [choice]
+    event.data.usage = None
+
+    chunk = _create_openai_chunk_from_mistral_chunk(event)
+
+    assert chunk.choices[0].finish_reason == "error"
+
+
+_MISTRAL_CACHED_USAGE = {
+    "prompt_tokens": 13406,
+    "completion_tokens": 2,
+    "total_tokens": 13408,
+    "prompt_tokens_details": {"cached_tokens": 13376},
+    "completion_tokens_details": {"reasoning_tokens": 0},
+}
+
+
+def test_create_mistral_completion_keeps_cached_tokens() -> None:
+    """Mistral sends prompt_tokens_details as an extra its UsageInfo model does not declare."""
+    pytest.importorskip("mistralai")
+    from mistralai.client.models import UsageInfo
+
+    from any_llm.providers.mistral.utils import _create_mistral_completion_from_response
+
+    response = Mock()
+    response.id = "chatcmpl-abc"
+    response.created = 1
+    response.choices = []
+    response.usage = UsageInfo.model_validate(_MISTRAL_CACHED_USAGE)
+
+    completion = _create_mistral_completion_from_response(response, model="mistral-small-latest")
+
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens_details is not None
+    assert completion.usage.prompt_tokens_details.cached_tokens == 13376
+    assert completion.usage.completion_tokens_details is not None
+    assert completion.usage.completion_tokens_details.reasoning_tokens == 0
+
+
+def test_create_mistral_chunk_keeps_cached_tokens() -> None:
+    pytest.importorskip("mistralai")
+    from mistralai.client.models import UsageInfo
+
+    from any_llm.providers.mistral.utils import _create_openai_chunk_from_mistral_chunk
+
+    event = Mock()
+    event.data.id = "chunk-1"
+    event.data.created = 1
+    event.data.model = "mistral-small-latest"
+    event.data.choices = []
+    event.data.usage = UsageInfo.model_validate(_MISTRAL_CACHED_USAGE)
+
+    chunk = _create_openai_chunk_from_mistral_chunk(event)
+
+    assert chunk.usage is not None
+    assert chunk.usage.prompt_tokens == 13406
+    assert chunk.usage.prompt_tokens_details is not None
+    assert chunk.usage.prompt_tokens_details.cached_tokens == 13376
+
+
+@pytest.mark.asyncio
+async def test_acompletion_forwards_prompt_cache_key() -> None:
+    pytest.importorskip("mistralai")
+    from any_llm.providers.mistral.mistral import MistralProvider
+
+    with (
+        patch("any_llm.providers.mistral.mistral.Mistral") as mocked_mistral,
+        patch("any_llm.providers.mistral.mistral._create_mistral_completion_from_response"),
+    ):
+        provider = MistralProvider(api_key="test-api-key")
+        mocked_mistral.return_value.chat.complete_async = AsyncMock(return_value=Mock())
+
+        await provider.acompletion(
+            model="mistral-small-latest",
+            messages=[{"role": "user", "content": "Hello"}],
+            prompt_cache_key="tenant-1",
+        )
+
+        assert mocked_mistral.return_value.chat.complete_async.call_args[1]["prompt_cache_key"] == "tenant-1"

@@ -10,9 +10,9 @@ requires-python = ">=3.11"
 version = "0.0.0-dev" # There is a regex in the release.yaml file that looks for this version string to set the version in the pyproject.toml file. Do not change this version string without updating the regex.
 dependencies = [
   "pydantic>2,<3",
-  "openai>=2.18.0",
+  "openai>=2.18.0,<4",
   "openresponses-types>=2.4.0,<3",
-  "anthropic>=0.119.0",
+  "anthropic>=0.124.0,<1",
   "rich",
   "httpx",
   "typing_extensions>=4.5.0",
@@ -21,7 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 
 all = [
-  "any-llm-sdk[mistral,anthropic,huggingface,gemini,vertexai,vertexaianthropic,cohere,cerebras,fireworks,gmi,groq,bedrock,azure,azureanthropic,azureopenai,cascadia,watsonx,together,sambanova,ollama,moonshot,neosantara,nebius,xai,databricks,deepseek,inception,openai,otari,openrouter,portkey,qiniu,requesty,lmstudio,llama,voyage,perplexity,platform,llamafile,llamacpp,sagemaker,github,zai,minimax,mzai,vllm,dashscope,deepinfra,atlascloud,telnyx,edenai,kenari,meta]"
+  "any-llm-sdk[mistral,anthropic,huggingface,gemini,vertexai,vertexaianthropic,cohere,cerebras,fireworks,gmi,groq,bedrock,azure,azureanthropic,azureopenai,cascadia,watsonx,together,sambanova,ollama,moonshot,neosantara,nebius,xai,databricks,deepseek,inception,openai,otari,openrouter,portkey,qiniu,requesty,lmstudio,llama,voyage,perplexity,platform,llamafile,llamacpp,liner,sagemaker,github,zai,minimax,mzai,vllm,dashscope,deepinfra,atlascloud,telnyx,edenai,kenari,meta,typesafe]"
 ]
 
 platform = [
@@ -33,39 +33,44 @@ platform = [
 perplexity = []
 
 mistral = [
-  "mistralai>=2.0.0",
+  "mistralai>=2.4.2",
 ]
 
 anthropic = []
 
 gemini = [
-  "google-genai>=1.51.0",
+  # 2.17.0 first models the stable Interactions API's diagnostic errors field.
+  "google-genai>=2.17.0",
   "google-cloud-storage",
 ]
 
 vertexai = [
-  "google-genai>=1.51.0",
+  "google-genai>=1.70.0",
   "google-cloud-storage",
 ]
 
 vertexaianthropic = [
-  "anthropic[vertex]>=0.119.0",
+  "anthropic[vertex]>=0.119.0,<1",
 ]
 
 azureanthropic = [
-  "anthropic>=0.119.0",
+  "anthropic>=0.124.0,<1",
 ]
 
 huggingface = [
-  "huggingface-hub",
+  "huggingface-hub>=0.30.0",
 ]
 
 cohere = [
-  "cohere",
+  "cohere>=7.0.5",
 ]
 
 cerebras = [
   "cerebras_cloud_sdk>=1.23.0",
+]
+
+fireworks = [
+  "fireworks-ai>=1.2.0",
 ]
 
 groq = [
@@ -85,7 +90,7 @@ watsonx = [
 ]
 
 together = [
-  "together>=2.0.0",
+  "together>=2.0.0,<3",
 ]
 
 ollama = [
@@ -97,7 +102,7 @@ voyage = [
 ]
 
 xai = [
-  "xai-sdk>=1.0.1",
+  "xai-sdk>=1.6.0",
 ]
 
 sagemaker = [
@@ -114,14 +119,14 @@ azureopenai = []
 cascadia = []
 databricks = []
 deepseek = []
-fireworks = []
 gmi = []
 otari = [
-  "otari>=0.3.0",
+  "otari>=0.4.0,<0.5",
 ]
 github = []
 inception = []
 kenari = []
+liner = []
 llama = []
 llamacpp = []
 llamafile = []
@@ -143,6 +148,10 @@ dashscope = []
 deepinfra = []
 edenai = []
 telnyx = []
+
+typesafe = [
+  "typesafe-sdk>=0.7.3,<0.8",
+]
 
 [project.urls]
 Documentation = "https://docs.mozilla.ai/any-llm/"
@@ -244,13 +253,9 @@ ignore_missing_imports = true # pytest related modules are not found
 
 [tool.pytest.ini_options]
 timeout = 120
-reruns = 5
-reruns_delay = 10
+# Integration tests retry; without this, only the last attempt leaves a traceback in the log.
+addopts = "--rerun-show-tracebacks"
 filterwarnings = [
-  # Silence Pydantic V1-style validator deprecation warnings coming from fireworks only
-  "ignore:Pydantic V1 style `@validator` validators are deprecated:pydantic.warnings.PydanticDeprecatedSince20:fireworks\\.client\\.image_api",
-  # Silence fireworks generated protos deprecation about BaseModelDetails.tunable only
-  "ignore:BaseModelDetails\\.tunable is deprecated:DeprecationWarning:fireworks\\.control_plane\\.generated\\.protos\\.gateway.*",
   # Silence model format deprecation warnings
   "ignore:Model format 'provider/model' is deprecated:DeprecationWarning",
 ]
@@ -274,7 +279,7 @@ docs = [
 
 
 lint = [
-  "pre-commit==4.6.1",
+  "pre-commit==4.6.2",
   "pre-commit-uv==4.3.0",
   "mypy",
   "types-aiofiles",
@@ -285,7 +290,7 @@ tests = [
   "pytest>=8,<10",
   "pytest-cov>=6.2.1,<8",
   "pytest-asyncio>=0.26.0",
-  "pytest-rerunfailures>=16.0",
+  "pytest-rerunfailures>=16.3",
   "mktestdocs>=0.2.4",
   "pytest-xdist>=3.6.1",
   "pytest-timeout",

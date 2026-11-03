@@ -19,7 +19,9 @@ try:
     from .utils import (
         _convert_batch_job_to_openai,
         _convert_models_list,
+        _convert_together_rerank_response,
         _convert_together_response_to_chat_completion,
+        _convert_video_job,
         _create_openai_chunk_from_together_chunk,
         _create_openai_embedding_response_from_together,
     )
@@ -29,12 +31,8 @@ except ImportError as e:
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
 
-    from together.types import (
-        ChatCompletionChunk as TogetherChatCompletionChunk,
-    )
-    from together.types import (
-        ChatCompletionResponse as TogetherChatCompletion,
-    )
+    from together.types.chat import ChatCompletion as TogetherChatCompletion
+    from together.types.chat import ChatCompletionChunk as TogetherChatCompletionChunk
 
     from any_llm.types.batch import Batch
     from any_llm.types.completion import (
@@ -44,6 +42,8 @@ if TYPE_CHECKING:
         CreateEmbeddingResponse,
     )
     from any_llm.types.model import Model
+    from any_llm.types.rerank import RerankResponse
+    from any_llm.types.video import VideoGenerationParams, VideoJob
 
 DEFAULT_SCHEMA_NAME = "response_schema"
 _SCHEMA_METADATA_KEYS = ("name", "description", "strict")
@@ -80,6 +80,8 @@ class TogetherProvider(AnyLLM):
 
     SUPPORTS_COMPLETION_STREAMING = True
     SUPPORTS_COMPLETION = True
+    SUPPORTS_COMPLETION_N = True
+    PROMPT_CACHE_KEY_SUPPORT = "supported"
     SUPPORTS_RESPONSES = False
     SUPPORTS_COMPLETION_REASONING = True
     SUPPORTS_COMPLETION_IMAGE = True
@@ -87,10 +89,12 @@ class TogetherProvider(AnyLLM):
     SUPPORTS_EMBEDDING = True
     SUPPORTS_LIST_MODELS = True
     SUPPORTS_BATCH = True
-    SUPPORTS_RERANK = False
+    SUPPORTS_RERANK = True
+    SUPPORTS_VIDEO_GENERATION = True
 
     # The Together SDK accepts a per-request `timeout` on its client calls, so it forwards unchanged.
     TIMEOUT_SUPPORT = "native"
+    MAX_RETRIES_SUPPORT = "native"
 
     MISSING_PACKAGES_ERROR = MISSING_PACKAGES_ERROR
 
@@ -101,7 +105,8 @@ class TogetherProvider(AnyLLM):
     def _convert_completion_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
         """Convert CompletionParams to kwargs for Together API."""
         converted_params = params.model_dump(
-            exclude_none=True, exclude={"model_id", "messages", "response_format", "stream_options"}
+            exclude_none=True,
+            exclude={"model_id", "messages", "response_format", "stream_options", "prompt_cache_key"},
         )
         if converted_params.get("reasoning_effort") in ("auto", "none"):
             converted_params.pop("reasoning_effort")
@@ -118,6 +123,18 @@ class TogetherProvider(AnyLLM):
                 converted_params["response_format"] = _convert_response_format(params.response_format)
 
         converted_params.update(kwargs)
+        # The Together SDK has no stream_options, prompt_cache_key or parallel_tool_calls argument,
+        # though the API takes all three; it only reports usage on a stream when
+        # stream_options.include_usage is set.
+        extra_body: dict[str, Any] = {}
+        if params.stream and params.stream_options is not None:
+            extra_body["stream_options"] = params.stream_options
+        if params.prompt_cache_key is not None:
+            extra_body["prompt_cache_key"] = params.prompt_cache_key
+        if converted_params.pop("parallel_tool_calls", None) is not None:
+            extra_body["parallel_tool_calls"] = params.parallel_tool_calls
+        if extra_body:
+            converted_params["extra_body"] = {**(converted_params.get("extra_body") or {}), **extra_body}
         return converted_params
 
     @staticmethod
@@ -153,6 +170,47 @@ class TogetherProvider(AnyLLM):
     def _convert_list_models_response(response: Any) -> Sequence[Model]:
         """Convert Together list models response to OpenAI format."""
         return _convert_models_list(response)
+
+    @staticmethod
+    @override
+    def _convert_rerank_params(model: str, query: str, documents: list[str], **kwargs: Any) -> dict[str, Any]:
+        """Convert rerank parameters for the Together API.
+
+        Raises:
+            UnsupportedParameterError: If `max_tokens_per_doc` or `rank_fields` is provided.
+        """
+        if kwargs.get("max_tokens_per_doc") is not None:
+            msg = "max_tokens_per_doc"
+            raise UnsupportedParameterError(
+                msg,
+                TogetherProvider.PROVIDER_NAME,
+                "Together's rerank endpoint has no per-document truncation limit.",
+            )
+        if kwargs.get("rank_fields") is not None:
+            msg = "rank_fields"
+            raise UnsupportedParameterError(
+                msg,
+                TogetherProvider.PROVIDER_NAME,
+                "Together only honors rank_fields when documents are JSON objects, "
+                "and the rerank signature types documents as list[str].",
+            )
+
+        params: dict[str, Any] = {
+            "query": query,
+            "documents": documents,
+        }
+        if kwargs.get("top_n") is not None:
+            params["top_n"] = kwargs["top_n"]
+        for key in ("return_documents",):
+            if key in kwargs:
+                params[key] = kwargs[key]
+        return params
+
+    @staticmethod
+    @override
+    def _convert_rerank_response(response: Any) -> RerankResponse:
+        """Convert a Together rerank response to a normalized RerankResponse."""
+        return _convert_together_rerank_response(response)
 
     @override
     def _init_client(self, api_key: str | None = None, api_base: str | None = None, **kwargs: Any) -> None:
@@ -226,6 +284,59 @@ class TogetherProvider(AnyLLM):
     async def _alist_models(self, **kwargs: Any) -> Sequence[Model]:
         models_list = await self.client.models.list(**kwargs)
         return self._convert_list_models_response(models_list)
+
+    @override
+    async def _arerank(
+        self,
+        model: str,
+        query: str,
+        documents: list[str],
+        **kwargs: Any,
+    ) -> RerankResponse:
+        rerank_kwargs = self._convert_rerank_params(model, query, documents, **kwargs)
+        response = await self.client.rerank.create(
+            model=model,
+            **rerank_kwargs,
+        )
+        return self._convert_rerank_response(response)
+
+    @staticmethod
+    def _convert_video_params(params: VideoGenerationParams, **kwargs: Any) -> dict[str, Any]:
+        """Convert VideoGenerationParams to kwargs for ``client.videos.create``.
+
+        Together takes the size as ``width``/``height``, the length as a string, and the first
+        and last frames as ``frame_images`` entries, which merge with any the caller passes.
+        """
+        create_kwargs: dict[str, Any] = {"model": params.model_id, "prompt": params.prompt}
+        if params.seconds is not None:
+            create_kwargs["seconds"] = str(params.seconds)
+        if (dimensions := params.parse_size()) is not None:
+            create_kwargs["width"], create_kwargs["height"] = dimensions
+        if params.seed is not None:
+            create_kwargs["seed"] = params.seed
+        if params.negative_prompt is not None:
+            create_kwargs["negative_prompt"] = params.negative_prompt
+        if params.reference_images is not None:
+            create_kwargs["reference_images"] = params.reference_images
+        frame_images = list(kwargs.pop("frame_images", None) or [])
+        if params.first_frame is not None:
+            frame_images.append({"input_image": params.first_frame, "frame": "first"})
+        if params.last_frame is not None:
+            frame_images.append({"input_image": params.last_frame, "frame": "last"})
+        if frame_images:
+            create_kwargs["frame_images"] = frame_images
+        create_kwargs.update(kwargs)
+        return create_kwargs
+
+    @override
+    async def _avideo_generation(self, params: VideoGenerationParams, **kwargs: Any) -> VideoJob:
+        job = await self.client.videos.create(**self._convert_video_params(params, **kwargs))
+        return _convert_video_job(job)
+
+    @override
+    async def _aretrieve_video(self, video_id: str, **kwargs: Any) -> VideoJob:
+        job = await self.client.videos.retrieve(video_id, **kwargs)
+        return _convert_video_job(job)
 
     @override
     async def _acreate_batch(

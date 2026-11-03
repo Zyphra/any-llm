@@ -10,11 +10,11 @@ from any_llm.types.completion import (
     ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageToolCall,
     Choice,
-    CompletionUsage,
     Function,
     Reasoning,
 )
 from any_llm.types.model import Model
+from any_llm.utils.usage import completion_usage_from_dict
 
 
 def _create_openai_chunk_from_cerebras_chunk(chunk: ChatChunkResponse) -> ChatCompletionChunk:
@@ -40,12 +40,10 @@ def _create_openai_chunk_from_cerebras_chunk(chunk: ChatChunkResponse) -> ChatCo
         "usage": None,
     }
 
-    delta: dict[str, Any] = {}
-    finish_reason = None
-
-    choices = getattr(chunk, "choices", None)
-    if choices and len(choices) > 0:
-        choice = choices[0]
+    choice_dicts: list[dict[str, Any]] = []
+    # With n > 1 a chunk carries one choice per completion, so each keeps its own index.
+    for position, choice in enumerate(getattr(chunk, "choices", None) or []):
+        delta: dict[str, Any] = {}
         finish_reason = getattr(choice, "finish_reason", None)
 
         choice_delta = getattr(choice, "delta", None)
@@ -80,22 +78,21 @@ def _create_openai_chunk_from_cerebras_chunk(chunk: ChatChunkResponse) -> ChatCo
             if reasoning_content:
                 delta["reasoning"] = {"content": reasoning_content}
 
+        index = getattr(choice, "index", None)
+        choice_dicts.append(
+            {
+                "index": index if isinstance(index, int) else position,
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }
+        )
+
     usage = getattr(chunk, "usage", None)
     if usage:
-        chunk_dict["usage"] = {
-            "prompt_tokens": getattr(usage, "prompt_tokens", None) or 0,
-            "completion_tokens": getattr(usage, "completion_tokens", None) or 0,
-            "total_tokens": getattr(usage, "total_tokens", None) or 0,
-        }
+        chunk_dict["usage"] = completion_usage_from_dict(usage.model_dump())
 
-    choice_dict = {
-        "index": 0,
-        "delta": delta,
-        "finish_reason": finish_reason,
-        "logprobs": None,
-    }
-
-    chunk_dict["choices"] = [choice_dict]
+    chunk_dict["choices"] = choice_dicts or [{"index": 0, "delta": {}, "finish_reason": None, "logprobs": None}]
 
     return ChatCompletionChunk.model_validate(chunk_dict)
 
@@ -144,12 +141,7 @@ def _convert_response(response_data: dict[str, Any]) -> ChatCompletion:
 
     usage = None
     if response_data.get("usage"):
-        usage_raw = response_data["usage"]
-        usage = CompletionUsage(
-            prompt_tokens=usage_raw.get("prompt_tokens", 0),
-            completion_tokens=usage_raw.get("completion_tokens", 0),
-            total_tokens=usage_raw.get("total_tokens", 0),
-        )
+        usage = completion_usage_from_dict(response_data["usage"])
 
     return ChatCompletion(
         id=response_data.get("id", ""),

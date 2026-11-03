@@ -11,6 +11,11 @@ from any_llm.exceptions import UnsupportedParameterError
 from any_llm.types.responses import ResponsesParams
 
 
+async def _response_event_stream() -> Any:
+    yield "response.created"
+    yield "response.completed"
+
+
 @pytest.mark.asyncio
 async def test_responses_invalid_model_format_no_slash() -> None:
     """Test responses raises ValueError for model without separator."""
@@ -142,6 +147,25 @@ async def test_timeout_forwarded_to_provider_not_params(
 
 
 @pytest.mark.asyncio
+async def test_transport_options_forwarded_to_provider_not_params() -> None:
+    """extra_headers/extra_query are SDK request options, and ResponsesParams forbids them as fields."""
+    llm = AnyLLM.create("openai", api_key="test-key")
+    with patch.object(type(llm), "_aresponses", new=AsyncMock(return_value=object())) as mock_aresponses:
+        await llm.aresponses(
+            "gpt-4.1-mini",
+            "hello",
+            extra_headers={"x-request-id": "request-123"},
+            extra_query={"trace": "enabled"},
+        )
+
+    assert mock_aresponses.call_args.kwargs["extra_headers"] == {"x-request-id": "request-123"}
+    assert mock_aresponses.call_args.kwargs["extra_query"] == {"trace": "enabled"}
+    params = mock_aresponses.call_args.args[0].model_dump(exclude_none=True)
+    assert "extra_headers" not in params
+    assert "extra_query" not in params
+
+
+@pytest.mark.asyncio
 async def test_aresponses_helper_forwards_timeout_to_provider() -> None:
     """The public aresponses() helper routes timeout through to the provider call."""
     provider = AnyLLM.create("openai", api_key="test-key")
@@ -164,6 +188,21 @@ def test_responses_helper_forwards_timeout_to_provider_sync() -> None:
         responses("gpt-4.1-mini", "hello", provider="openai", api_key="test-key", timeout=60)
 
     assert mock_aresponses.call_args.kwargs["timeout"] == 60
+
+
+def test_responses_helper_streaming_returns_sync_iterator() -> None:
+    """The synchronous Responses API must bridge an async event stream."""
+    provider = AnyLLM.create("openai", api_key="test-key")
+    with (
+        patch("any_llm.any_llm.AnyLLM.create", return_value=provider),
+        patch.object(provider, "_aresponses", new=AsyncMock(return_value=_response_event_stream())) as mock_aresponses,
+    ):
+        stream = responses("gpt-4.1-mini", "hello", provider="openai", api_key="test-key", stream=True)
+        events = list(stream)
+        assert all(isinstance(event, str) for event in events)
+        assert cast("list[str]", events) == ["response.created", "response.completed"]
+
+    assert mock_aresponses.call_args.args[0].stream is True
 
 
 @pytest.mark.asyncio

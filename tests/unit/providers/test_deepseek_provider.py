@@ -1,14 +1,19 @@
 import dataclasses
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import pytest
 from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk as OpenAIChatCompletionChunk
 from pydantic import BaseModel
 
+from any_llm.exceptions import InvalidRequestError
 from any_llm.providers.deepseek.deepseek import DeepseekProvider
-from any_llm.providers.deepseek.utils import _preprocess_messages, _reinject_reasoning_content
-from any_llm.types.completion import CompletionParams
+from any_llm.providers.deepseek.utils import ReasoningReplayStream, _preprocess_messages, _reinject_reasoning_content
+from any_llm.types.completion import ChatCompletionChunk, ChatCompletionMessage, CompletionParams, ReasoningEffort
+from any_llm.utils.streaming import aaccumulate_chunks
 
 
 class PersonResponseFormat(BaseModel):
@@ -75,6 +80,64 @@ async def test_preprocess_messages_with_non_pydantic_response_format() -> None:
     assert processed_params.messages == messages
 
 
+def test_preprocess_messages_with_json_schema_dict() -> None:
+    """A json_schema dict, which DeepSeek rejects, becomes JSON mode with the schema in the prompt."""
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "Name this session"}],
+        response_format={"type": "json_schema", "json_schema": {"name": "structured_output", "schema": schema}},
+    )
+
+    processed_params = _preprocess_messages(params)
+
+    assert processed_params.response_format == {"type": "json_object"}
+    content = processed_params.messages[0]["content"]
+    assert json.dumps(schema, indent=2) in content
+    assert "Name this session" in content
+
+
+def test_preprocess_messages_with_json_schema_dict_without_a_schema() -> None:
+    """OpenAI's json_schema format makes the schema optional, so its absence asks for JSON of any shape."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format={"type": "json_schema", "json_schema": {"name": "structured_output"}},
+    )
+
+    processed_params = _preprocess_messages(params)
+
+    assert processed_params.response_format == {"type": "json_object"}
+    content = processed_params.messages[0]["content"]
+    assert "Please respond with a JSON object.\n" in content
+    assert "schema" not in content
+    assert "Hello" in content
+
+
+@pytest.mark.parametrize(
+    ("response_format", "message"),
+    [
+        ({"type": "json_schema"}, "must include a 'json_schema' object"),
+        ({"type": "json_schema", "json_schema": "structured_output"}, "must include a 'json_schema' object"),
+        (
+            {"type": "json_schema", "json_schema": {"name": "structured_output", "schema": "object"}},
+            "must be a JSON schema object",
+        ),
+    ],
+)
+def test_preprocess_messages_rejects_a_malformed_json_schema_dict(
+    response_format: dict[str, Any], message: str
+) -> None:
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format=response_format,
+    )
+
+    with pytest.raises(InvalidRequestError, match=message):
+        _preprocess_messages(params)
+
+
 @pytest.mark.asyncio
 async def test_preprocess_messages_with_dataclass() -> None:
     """Test that a dataclass is converted to DeepSeek JSON format."""
@@ -95,6 +158,29 @@ async def test_preprocess_messages_with_dataclass() -> None:
     assert "Generate a person" in processed_params.messages[0]["content"]
     assert "name" in processed_params.messages[0]["content"]
     assert "age" in processed_params.messages[0]["content"]
+
+
+def test_preprocess_messages_keeps_content_parts_with_structured_output() -> None:
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    original = {"role": "user", "content": [{"type": "text", "text": "Who is this?"}, image_part]}
+    params = CompletionParams(model_id="deepseek-flash", messages=[original], response_format=PersonResponseFormat)
+
+    processed_params = _preprocess_messages(params)
+
+    content = processed_params.messages[0]["content"]
+    assert content[0]["type"] == "text"
+    assert "JSON object" in content[0]["text"]
+    assert content[1:] == [{"type": "text", "text": "Who is this?"}, image_part]
+    assert original["content"] == [{"type": "text", "text": "Who is this?"}, image_part]
+
+
+def test_preprocess_messages_does_not_mutate_caller_message_with_structured_output() -> None:
+    original = {"role": "user", "content": "Generate a person"}
+    params = CompletionParams(model_id="deepseek-flash", messages=[original], response_format=PersonResponseFormat)
+
+    _preprocess_messages(params)
+
+    assert original["content"] == "Generate a person"
 
 
 def test_convert_completion_response_extracts_cached_tokens() -> None:
@@ -130,6 +216,41 @@ def test_convert_completion_response_extracts_cached_tokens() -> None:
     assert result.usage.total_tokens == 150
     assert result.usage.prompt_tokens_details is not None
     assert result.usage.prompt_tokens_details.cached_tokens == 80
+    dumped = result.usage.model_dump()
+    assert dumped["prompt_cache_hit_tokens"] == 80
+    assert dumped["prompt_cache_miss_tokens"] == 20
+
+
+def test_convert_completion_response_preserves_zero_cache_hit_tokens() -> None:
+    """A reported zero hit count stays distinguishable from a response without cache accounting."""
+    response = OpenAIChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "deepseek-chat",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello!"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 100,
+            },
+        }
+    )
+
+    result = DeepseekProvider._convert_completion_response(response)
+
+    assert result.usage is not None
+    assert result.usage.prompt_tokens_details is not None
+    assert result.usage.prompt_tokens_details.cached_tokens == 0
 
 
 def test_convert_completion_response_without_cached_tokens() -> None:
@@ -251,19 +372,20 @@ def test_deepseek_no_max_tokens_when_neither_set() -> None:
     assert "max_completion_tokens" not in result
 
 
-def test_deepseek_thinking_disabled_by_default_for_v4_model() -> None:
-    """V4 model ids without reasoning_effort should default to thinking disabled."""
+def test_deepseek_preserves_provider_thinking_default() -> None:
+    """No explicit effort leaves DeepSeek's enabled/high provider default in control."""
     params = CompletionParams(
         model_id="deepseek-v4-flash",
         messages=[{"role": "user", "content": "hi"}],
         reasoning_effort=None,
     )
     result = DeepseekProvider._convert_completion_params(params)
-    assert result["extra_body"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in result
+    assert "extra_body" not in result
 
 
 def test_deepseek_thinking_disabled_for_none_reasoning_effort_value() -> None:
-    """reasoning_effort="none" is also treated as "no reasoning requested"."""
+    """An explicit none uses DeepSeek's thinking toggle, not an invalid wire effort."""
     params = CompletionParams(
         model_id="deepseek-v4-pro",
         messages=[{"role": "user", "content": "hi"}],
@@ -271,52 +393,353 @@ def test_deepseek_thinking_disabled_for_none_reasoning_effort_value() -> None:
     )
     result = DeepseekProvider._convert_completion_params(params)
     assert result["extra_body"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in result
 
 
-def test_deepseek_thinking_disabled_for_auto_reasoning_effort_value() -> None:
-    """reasoning_effort="auto" (the default) is treated as "no reasoning requested"."""
+def test_deepseek_auto_preserves_provider_thinking_default() -> None:
+    """The normalized auto sentinel does not override DeepSeek's provider default."""
     params = CompletionParams(
         model_id="deepseek-v4-flash",
         messages=[{"role": "user", "content": "hi"}],
         reasoning_effort="auto",
     )
     result = DeepseekProvider._convert_completion_params(params)
+    assert "reasoning_effort" not in result
+    assert "extra_body" not in result
+
+
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_effort"),
+    [("low", "low"), ("medium", "high"), ("high", "high"), ("xhigh", "high"), ("max", "max")],
+)
+def test_deepseek_maps_current_reasoning_efforts(reasoning_effort: ReasoningEffort, expected_effort: str) -> None:
+    """Normalized efforts map to DeepSeek's current low, high, and max wire values."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort=reasoning_effort,
+    )
+    result = DeepseekProvider._convert_completion_params(params)
+    assert result["extra_body"]["thinking"] == {"type": "enabled"}
+    assert result["reasoning_effort"] == expected_effort
+
+
+def test_deepseek_rejects_unsupported_minimal_reasoning_effort() -> None:
+    """DeepSeek Chat does not document OpenAI's minimal effort."""
+    params = CompletionParams(
+        model_id="deepseek-v4-pro",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="minimal",
+    )
+
+    with pytest.raises(InvalidRequestError, match="minimal"):
+        DeepseekProvider._convert_completion_params(params)
+
+
+@pytest.mark.asyncio
+async def test_deepseek_acompletion_keeps_minimal_for_its_own_rejection() -> None:
+    """DeepSeek's own API rejects minimal, so the V4 template mapping does not soften it."""
+    provider = DeepseekProvider(api_key="sk-test")
+
+    with pytest.raises(InvalidRequestError, match="minimal"):
+        await provider.acompletion(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="minimal",
+        )
+
+
+def test_deepseek_thinking_respects_explicit_extra_body_override() -> None:
+    """Caller-supplied DeepSeek fields take precedence over normalized controls."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="max",
+        user="ignored.invalid-user",
+    )
+    result = DeepseekProvider._convert_completion_params(
+        params,
+        extra_body={"thinking": {"type": "disabled"}, "user_id": "caller-user"},
+    )
+    assert result["reasoning_effort"] == "max"
+    assert result["extra_body"] == {"thinking": {"type": "disabled"}, "user_id": "caller-user"}
+
+
+def test_deepseek_does_not_mutate_reused_extra_body_when_mapping_user() -> None:
+    extra_body = {"custom": "value"}
+    results: list[dict[str, Any]] = []
+
+    for user in ("alice", "bob"):
+        params = CompletionParams(
+            model_id="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="low",
+            user=user,
+        )
+
+        results.append(DeepseekProvider._convert_completion_params(params, extra_body=extra_body))
+
+        assert extra_body == {"custom": "value"}
+
+    assert results[0]["extra_body"] == {
+        "custom": "value",
+        "thinking": {"type": "enabled"},
+        "user_id": "alice",
+    }
+    assert results[1]["extra_body"] == {
+        "custom": "value",
+        "thinking": {"type": "enabled"},
+        "user_id": "bob",
+    }
+    assert all(result["extra_body"] is not extra_body for result in results)
+
+
+@pytest.mark.asyncio
+async def test_deepseek_emits_current_chat_wire_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "deepseek-v4-pro",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    user_id = "a" * 512
+    provider = DeepseekProvider(
+        api_key="test-key",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle_request)),
+        max_retries=0,
+    )
+    try:
+        await provider.acompletion(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": "Use the lookup tool"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "extra_content": {"deepseek": {"reasoning_content": "I should use lookup."}},
+                },
+            ],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            reasoning_effort="medium",
+            user=user_id,
+            n=2,
+            frequency_penalty=0.5,
+            presence_penalty=0.5,
+            seed=7,
+            parallel_tool_calls=False,
+            logit_bias={"123": 1.0},
+            service_tier="priority",
+        )
+    finally:
+        await provider.client.close()
+
+    assert len(requests) == 1
+    request = requests[0]
+    body = json.loads(request.content)
+    assert request.url.path == "/chat/completions"
+    assert body["model"] == "deepseek-v4-pro"
+    assert body["reasoning_effort"] == "high"
+    assert body["thinking"] == {"type": "enabled"}
+    assert body["user_id"] == user_id
+    assert body["messages"][1]["reasoning_content"] == "I should use lookup."
+    assert "extra_content" not in body["messages"][1]
+    for field in (
+        "user",
+        "n",
+        "frequency_penalty",
+        "presence_penalty",
+        "seed",
+        "parallel_tool_calls",
+        "logit_bias",
+        "service_tier",
+    ):
+        assert field not in body
+
+
+@pytest.mark.parametrize("user_id", ["", "account.42", "a" * 513])
+def test_deepseek_rejects_invalid_user_id(user_id: str) -> None:
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        user=user_id,
+    )
+
+    with pytest.raises(InvalidRequestError, match="user_id"):
+        DeepseekProvider._convert_completion_params(params)
+
+
+@pytest.mark.parametrize(
+    ("params_kwargs", "expected_extra_body"),
+    [
+        ({"user": "account_42"}, {"user_id": "account_42"}),
+        ({"reasoning_effort": "low"}, {"thinking": {"type": "enabled"}}),
+    ],
+)
+def test_deepseek_treats_explicit_none_extra_body_as_absent(
+    params_kwargs: dict[str, Any], expected_extra_body: dict[str, Any]
+) -> None:
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        **params_kwargs,
+    )
+
+    result = DeepseekProvider._convert_completion_params(params, extra_body=None)
+
+    assert result["extra_body"] == expected_extra_body
+
+
+@pytest.mark.parametrize("reasoning_effort", [None, "auto", "low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+def test_deepseek_forwards_supported_tool_choice_when_thinking_effectively_enabled(
+    reasoning_effort: ReasoningEffort | None,
+    tool_choice: str,
+) -> None:
+    """Thinking supports both automatic tool selection and disabling tool calls."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort=reasoning_effort,
+        tool_choice=tool_choice,
+    )
+
+    result = DeepseekProvider._convert_completion_params(params)
+
+    assert result["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize("reasoning_effort", [None, "auto", "low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "required",
+        {"type": "function", "function": {"name": "get_weather"}},
+    ],
+)
+def test_deepseek_rejects_forced_tool_choice_when_thinking_effectively_enabled(
+    reasoning_effort: ReasoningEffort | None, tool_choice: str | dict[str, Any]
+) -> None:
+    """DeepSeek thinking rejects required and named-function choices; refuse before sending."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort=reasoning_effort,
+        tool_choice=tool_choice,
+    )
+
+    with pytest.raises(InvalidRequestError, match="tool_choice"):
+        DeepseekProvider._convert_completion_params(params)
+
+
+@pytest.mark.parametrize(
+    "tool_choice", ["auto", "none", "required", {"type": "function", "function": {"name": "get_weather"}}]
+)
+def test_deepseek_forwards_tool_choice_unchanged_when_thinking_explicitly_disabled(
+    tool_choice: str | dict[str, Any],
+) -> None:
+    """DeepSeek's tool_choice restriction is specific to thinking mode; disabled thinking forwards it as-is."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+        tool_choice=tool_choice,
+    )
+
+    result = DeepseekProvider._convert_completion_params(params)
+
+    assert result["tool_choice"] == tool_choice
     assert result["extra_body"]["thinking"] == {"type": "disabled"}
 
 
-def test_deepseek_thinking_enabled_when_reasoning_effort_set() -> None:
-    """An explicit reasoning_effort should enable thinking mode and be passed through."""
+def test_deepseek_tool_choice_absent_is_unaffected_regardless_of_thinking() -> None:
+    """No tool_choice at all should not raise or synthesize one, whatever thinking mode resolves to."""
+    for reasoning_effort in (None, "high", "none"):
+        params = CompletionParams(
+            model_id="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort=reasoning_effort,
+        )
+
+        result = DeepseekProvider._convert_completion_params(params)
+
+        assert "tool_choice" not in result
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+def test_deepseek_supported_tool_choice_forwarded_when_caller_extra_body_enables_thinking(tool_choice: str) -> None:
+    """Effective mode is resolved after the caller's extra_body.thinking override, not just reasoning_effort."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+        tool_choice=tool_choice,
+    )
+
+    result = DeepseekProvider._convert_completion_params(
+        params,
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+
+    assert result["tool_choice"] == tool_choice
+    assert result["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+def test_deepseek_tool_choice_rejected_when_caller_extra_body_enables_thinking() -> None:
+    """A caller override that turns thinking on must still gate tool_choice, even though reasoning_effort says none."""
+    params = CompletionParams(
+        model_id="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+        tool_choice="required",
+    )
+
+    with pytest.raises(InvalidRequestError, match="tool_choice"):
+        DeepseekProvider._convert_completion_params(params, extra_body={"thinking": {"type": "enabled"}})
+
+
+def test_deepseek_tool_choice_forwarded_when_caller_extra_body_disables_thinking() -> None:
+    """A caller override that turns thinking off must forward tool_choice even though reasoning_effort implies enabled."""
     params = CompletionParams(
         model_id="deepseek-v4-flash",
         messages=[{"role": "user", "content": "hi"}],
         reasoning_effort="high",
+        tool_choice="required",
     )
-    result = DeepseekProvider._convert_completion_params(params)
-    assert result["extra_body"]["thinking"] == {"type": "enabled"}
-    assert result["reasoning_effort"] == "high"
+
+    result = DeepseekProvider._convert_completion_params(
+        params,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+
+    assert result["tool_choice"] == "required"
+    assert result["extra_body"]["thinking"] == {"type": "disabled"}
 
 
-def test_deepseek_thinking_untouched_for_legacy_model_ids() -> None:
-    """Legacy deepseek-chat/deepseek-reasoner ids must not get the thinking toggle injected."""
-    for model_id in ("deepseek-chat", "deepseek-reasoner"):
-        params = CompletionParams(
-            model_id=model_id,
-            messages=[{"role": "user", "content": "hi"}],
-            reasoning_effort="high",
-        )
-        result = DeepseekProvider._convert_completion_params(params)
-        assert "extra_body" not in result
-
-
-def test_deepseek_thinking_respects_explicit_extra_body_override() -> None:
-    """A caller-supplied extra_body/thinking value should not be clobbered by the default."""
+def test_deepseek_tool_choice_does_not_mutate_caller_dict() -> None:
+    """The tool_choice gate must not mutate the caller's params or extra_body dicts."""
+    extra_body = {"thinking": {"type": "enabled"}}
     params = CompletionParams(
         model_id="deepseek-v4-flash",
         messages=[{"role": "user", "content": "hi"}],
-        reasoning_effort=None,
+        tool_choice="auto",
     )
-    result = DeepseekProvider._convert_completion_params(params, extra_body={"thinking": {"type": "enabled"}})
-    assert result["extra_body"]["thinking"] == {"type": "enabled"}
+    params_before = params.model_copy(deep=True)
+
+    result = DeepseekProvider._convert_completion_params(params, extra_body=extra_body)
+
+    assert result["tool_choice"] == "auto"
+    assert extra_body == {"thinking": {"type": "enabled"}}
+    assert params == params_before
 
 
 def test_convert_completion_response_stashes_reasoning_into_extra_content() -> None:
@@ -389,7 +812,7 @@ def test_reinject_reasoning_content_on_tool_call_message() -> None:
         {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
     ]
 
-    result = _reinject_reasoning_content(messages)
+    result = _reinject_reasoning_content(messages, replay_reasoning=True)
 
     assert result[1]["reasoning_content"] == "I should call get_weather."
     # The any_llm-internal extra_content must not be forwarded to DeepSeek's API.
@@ -399,8 +822,8 @@ def test_reinject_reasoning_content_on_tool_call_message() -> None:
     assert "extra_content" in messages[1]
 
 
-def test_reinject_reasoning_content_skips_non_tool_call_message() -> None:
-    """Assistant messages without tool_calls should be left untouched."""
+def test_reinject_reasoning_content_includes_assistant_turn_without_tool_call() -> None:
+    """A request carrying tools replays reasoning from every previous assistant turn."""
     messages: list[dict[str, Any]] = [
         {"role": "user", "content": "hi"},
         {
@@ -410,11 +833,63 @@ def test_reinject_reasoning_content_skips_non_tool_call_message() -> None:
         },
     ]
 
-    result = _reinject_reasoning_content(messages)
+    result = _reinject_reasoning_content(messages, replay_reasoning=True)
 
-    assert "reasoning_content" not in result[1]
-    # extra_content is any_llm-internal and is stripped even when reasoning is not reinjected.
+    assert result[1]["reasoning_content"] == "greeting"
+    # extra_content remains internal and is stripped after its reasoning is reinjected.
     assert "extra_content" not in result[1]
+
+
+def test_preprocess_messages_replays_all_assistant_reasoning_when_tools_are_present() -> None:
+    params = CompletionParams(
+        model_id="deepseek-v4-pro",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "hello",
+                "extra_content": {"deepseek": {"reasoning_content": "greeting"}},
+            }
+        ],
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+    )
+
+    processed = _preprocess_messages(params)
+
+    assert processed.messages[0]["reasoning_content"] == "greeting"
+    assert "extra_content" not in processed.messages[0]
+
+
+def test_preprocess_messages_omits_assistant_reasoning_without_tools() -> None:
+    params = CompletionParams(
+        model_id="deepseek-v4-pro",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "hello",
+                "extra_content": {"deepseek": {"reasoning_content": "greeting"}},
+            }
+        ],
+    )
+
+    processed = _preprocess_messages(params)
+
+    assert "reasoning_content" not in processed.messages[0]
+    assert "extra_content" not in processed.messages[0]
+
+
+def test_reinject_reasoning_content_omits_reasoning_without_tools() -> None:
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "hello",
+            "extra_content": {"deepseek": {"reasoning_content": "greeting"}},
+        }
+    ]
+
+    result = _reinject_reasoning_content(messages, replay_reasoning=False)
+
+    assert "reasoning_content" not in result[0]
+    assert "extra_content" not in result[0]
 
 
 def test_reinject_reasoning_content_handles_missing_extra_content() -> None:
@@ -429,6 +904,190 @@ def test_reinject_reasoning_content_handles_missing_extra_content() -> None:
         },
     ]
 
-    result = _reinject_reasoning_content(messages)
+    result = _reinject_reasoning_content(messages, replay_reasoning=True)
 
     assert "reasoning_content" not in result[0]
+
+
+def make_stream_chunk(
+    delta: dict[str, Any], *, index: int = 0, finish_reason: str | None = None
+) -> ChatCompletionChunk:
+    return DeepseekProvider._convert_completion_chunk_response(
+        OpenAIChatCompletionChunk.model_validate(
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "deepseek-v4-pro",
+                "choices": [{"index": index, "delta": delta, "finish_reason": finish_reason}],
+            }
+        )
+    )
+
+
+class FakeStream:
+    def __init__(self, chunks: list[ChatCompletionChunk]) -> None:
+        self._chunks = iter(chunks)
+        self.closed = False
+
+    def __aiter__(self) -> "FakeStream":
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def collect(stream: AsyncIterator[ChatCompletionChunk]) -> list[ChatCompletionChunk]:
+    return [chunk async for chunk in stream]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_replay_stream_stashes_full_reasoning_on_the_finishing_chunk() -> None:
+    chunks = [
+        make_stream_chunk({"role": "assistant", "reasoning_content": "I should "}),
+        make_stream_chunk({"reasoning_content": "call lookup."}),
+        make_stream_chunk({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "lookup"}}]}),
+        make_stream_chunk({"content": ""}, finish_reason="tool_calls"),
+    ]
+
+    result = await collect(ReasoningReplayStream(FakeStream(chunks)))
+
+    assert [chunk.choices[0].delta.extra_content for chunk in result] == [
+        None,
+        None,
+        None,
+        {"deepseek": {"reasoning_content": "I should call lookup."}},
+    ]
+    assert [chunk.choices[0].delta.reasoning for chunk in result[:2]] == [
+        chunk.choices[0].delta.reasoning for chunk in chunks[:2]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_replay_stream_leaves_a_turn_without_reasoning_alone() -> None:
+    chunks = [
+        make_stream_chunk({"content": "Hi"}),
+        make_stream_chunk({"content": "!"}, finish_reason="stop"),
+    ]
+
+    result = await collect(ReasoningReplayStream(FakeStream(chunks)))
+
+    assert all(chunk.choices[0].delta.extra_content is None for chunk in result)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_replay_stream_keeps_choices_apart_and_existing_extra_content() -> None:
+    finishing = make_stream_chunk({"content": ""}, index=1, finish_reason="stop")
+    finishing.choices[0].delta.extra_content = {"other": {"kept": True}}
+    chunks = [
+        make_stream_chunk({"reasoning_content": "zero"}, index=0),
+        make_stream_chunk({"reasoning_content": "one"}, index=1),
+        finishing,
+        make_stream_chunk({"content": ""}, index=0, finish_reason="stop"),
+    ]
+
+    result = await collect(ReasoningReplayStream(FakeStream(chunks)))
+
+    assert result[2].choices[0].delta.extra_content == {
+        "other": {"kept": True},
+        "deepseek": {"reasoning_content": "one"},
+    }
+    assert result[3].choices[0].delta.extra_content == {"deepseek": {"reasoning_content": "zero"}}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_replay_stream_closes_the_underlying_stream() -> None:
+    source = FakeStream([])
+    stream = ReasoningReplayStream(source)
+
+    await stream.aclose()
+
+    assert source.closed
+
+
+def sse_response(events: list[dict[str, Any]]) -> httpx.Response:
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+
+
+def stream_event(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-stream",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "deepseek-v4-pro",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_streamed_tool_call_turn_replays_reasoning_content() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(json.loads(request.content))
+        if len(requests) > 1:
+            return sse_response([stream_event({"role": "assistant", "content": "Sunny."}, "stop")])
+        return sse_response(
+            [
+                stream_event({"role": "assistant", "reasoning_content": "I need "}),
+                stream_event({"reasoning_content": "the weather."}),
+                stream_event(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "weather", "arguments": '{"city":'},
+                            }
+                        ]
+                    }
+                ),
+                stream_event({"tool_calls": [{"index": 0, "function": {"arguments": ' "Paris"}'}}]}),
+                stream_event({"content": ""}, "tool_calls"),
+            ]
+        )
+
+    provider = DeepseekProvider(
+        api_key="test-key",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle_request)),
+        max_retries=0,
+    )
+    tools = [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}]
+    messages: list[dict[str, Any] | ChatCompletionMessage] = [{"role": "user", "content": "Weather in Paris?"}]
+    try:
+        stream = await provider.acompletion(
+            model="deepseek-v4-pro", messages=messages, tools=tools, stream=True, reasoning_effort="low"
+        )
+        completion = await aaccumulate_chunks(stream)
+
+        message = completion.choices[0].message
+        assert message.extra_content == {"deepseek": {"reasoning_content": "I need the weather."}}
+        messages.append(message)
+        messages.append({"role": "tool", "tool_call_id": "call_1", "content": "sunny"})
+
+        second_turn = await aaccumulate_chunks(
+            await provider.acompletion(
+                model="deepseek-v4-pro", messages=messages, tools=tools, stream=True, reasoning_effort="low"
+            )
+        )
+        assert second_turn.choices[0].message.content == "Sunny."
+    finally:
+        await provider.client.close()
+
+    for body in requests:
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["reasoning_effort"] == "low"
+    replayed = requests[1]["messages"][1]
+    assert replayed["reasoning_content"] == "I need the weather."
+    assert replayed["tool_calls"][0]["function"] == {"name": "weather", "arguments": '{"city": "Paris"}'}
+    assert "extra_content" not in replayed
+    assert "extra_content" not in replayed["tool_calls"][0]
