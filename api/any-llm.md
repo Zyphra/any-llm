@@ -16,6 +16,9 @@ def create(
     provider: str | LLMProvider,
     api_key: str | None = None,
     api_base: str | None = None,
+    *,
+    unified_exceptions: bool | None = None,
+    max_retries: int | None = None,
     **kwargs: Any,
 ) -> AnyLLM
 ```
@@ -25,6 +28,8 @@ def create(
 | `provider` | `str \| LLMProvider` | *required* | The provider name (e.g., 'openai', 'anthropic') |
 | `api_key` | `str \| None` | None | API key for the provider |
 | `api_base` | `str \| None` | None | Base URL for the provider API |
+| `unified_exceptions` | `bool \| None` | None | Convert provider exceptions for this instance when True, or preserve them when False. None (default) uses ANY_LLM_UNIFIED_EXCEPTIONS. |
+| `max_retries` | `int \| None` | None | How many times the provider's SDK client retries a failed request (0 disables retries). None (default) keeps the SDK's own default. Raises UnsupportedParameterError for providers whose SDK has no retry count to set. |
 | `**kwargs` | `Any` | *required* | Additional provider-specific arguments |
 
 **Returns:** An `AnyLLM` instance bound to the specified provider.
@@ -50,6 +55,8 @@ Parses a combined `"provider:model"` string into its components.
 ```
 def split_model_provider(
     model: str,
+    *,
+    stacklevel: int = 3,
 ) -> tuple[str | LLMProvider, str]
 ```
 
@@ -139,6 +146,51 @@ List available models for this provider. See the [List Models](list-models.md) r
 ```
 def list_models(self, **kwargs) -> Sequence[Model]
 async def alist_models(self, **kwargs) -> Sequence[Model]
+```
+
+### `decide()` / `adecide()`
+
+Answer named yes/no, choice and score questions about a state. See the [Decide](decide.md) reference.
+
+```
+def decide(self, model, state, questions, *, images=None, **kwargs) -> DecideResponse
+async def adecide(self, model, state, questions, *, images=None, timeout=None, **kwargs) -> DecideResponse
+```
+
+### `video_generation()` / `avideo_generation()`
+
+Start a video generation job. The provider returns a `VideoJob` to poll rather than a video. See the [Video](video.md) reference.
+
+```
+def video_generation(self, model, prompt, **kwargs) -> VideoJob
+async def avideo_generation(self, model, prompt, *, seconds=None, size=None, seed=None, negative_prompt=None, reference_images=None, first_frame=None, last_frame=None, **kwargs) -> VideoJob
+```
+
+### `retrieve_video()` / `aretrieve_video()`
+
+Read a video job's status, and its outputs once it is completed.
+
+```
+def retrieve_video(self, video_id, **kwargs) -> VideoJob
+async def aretrieve_video(self, video_id, **kwargs) -> VideoJob
+```
+
+### `poll_video()` / `apoll_video()`
+
+Retrieve a video job until it is `completed` or `failed`, or raise `TimeoutError` after `timeout` seconds.
+
+```
+def poll_video(self, video_id, *, poll_interval=5.0, timeout=600.0, **kwargs) -> VideoJob
+async def apoll_video(self, video_id, *, poll_interval=5.0, timeout=600.0, **kwargs) -> VideoJob
+```
+
+### `download_video()` / `adownload_video()`
+
+Return one entry of `VideoJob.outputs` as bytes, decoding inline data or fetching its URL.
+
+```
+def download_video(self, output, **kwargs) -> bytes
+async def adownload_video(self, output, **kwargs) -> bytes
 ```
 
 ### `create_batch()` / `acreate_batch()`

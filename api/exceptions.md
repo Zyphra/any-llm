@@ -6,7 +6,7 @@ description: Unified exception hierarchy for all providers
 any-llm provides a unified exception hierarchy so you can handle errors consistently regardless of which provider is being used. When unified exceptions are enabled, provider-specific SDK errors are automatically mapped to the appropriate any-llm exception type.
 
 {% hint style="info" %}
-**Opt-in Feature:** Unified exception handling is opt-in. Set the `ANY_LLM_UNIFIED_EXCEPTIONS=1` environment variable to enable automatic conversion from provider-specific exceptions.
+**Opt-in Feature:** Unified exception handling is opt-in. Pass `unified_exceptions=True` when creating a provider, or set the `ANY_LLM_UNIFIED_EXCEPTIONS=1` environment variable, to enable automatic conversion from provider-specific exceptions.
 {% endhint %}
 
 ## Exception Hierarchy
@@ -27,6 +27,7 @@ AnyLLMError
 ├── MissingApiKeyError
 ├── ModelNotFoundError
 ├── ProviderError
+├── ProviderFileNotFoundError
 ├── RateLimitError
 ├── UnsupportedParameterError
 ├── UnsupportedProviderError
@@ -223,6 +224,8 @@ Every exception above is a **separate** subclass of `AnyLLMError`, not of each o
 A 400 or 422 means the request was rejected but not why, so the error message decides between the specific causes that carry no status of their own (`ContextLengthExceededError`, `ContentFilterError`, or a provider that reports a bad key as a 400), falling back to `InvalidRequestError`. When there is no status at all, or the status is not one of those listed above (for example 409 or 413), the message decides on its own.
 
 One consequence worth noting: a 5xx is always a provider fault, even when its body happens to mention something like a content policy.
+
+A provider can pick the type itself before the status and message are consulted, for SDK errors whose class says more than either. TypeSafe does this: see its provider page for the cases it handles.
 
 ## Usage
 

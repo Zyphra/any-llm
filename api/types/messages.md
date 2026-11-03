@@ -38,7 +38,7 @@ Token usage information for Messages API.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `iterations` | `list[BetaMessageIterationUsage \| BetaCompactionIterationUsage \| BetaAdvisorMessageIterationUsage \| BetaFallbackMessageIterationUsage] \| None` |  |
+| `iterations` | `list[Annotated[MessageIterationUsage \| BetaCompactionIterationUsage \| BetaAdvisorMessageIterationUsage \| BetaFallbackMessageIterationUsage, FieldInfo(annotation=NoneType, required=True, discriminator='type')]] \| None` |  |
 | `speed` | `Literal['standard', 'fast'] \| None` |  |
 
 ### `MessageStreamEvent`
@@ -71,9 +71,9 @@ Normalized parameters for the Anthropic Messages API, used internally to pass st
 | `messages` | `list[dict[str, Any]]` | List of messages for the conversation |
 | `max_tokens` | `int` | Maximum number of tokens to generate (required by Anthropic API) |
 | `system` | `str \| list[dict[str, Any]] \| None` | System prompt (string or list of content blocks with optional cache_control) |
-| `temperature` | `float \| None` | Controls randomness in the response (0.0 to 1.0) |
-| `top_p` | `float \| None` | Controls diversity via nucleus sampling |
-| `top_k` | `int \| None` | Only sample from the top K options for each subsequent token |
+| `temperature` | `float \| None` | Controls randomness in the response (0.0 to 1.0); Anthropic deprecates this for current Claude models. |
+| `top_p` | `float \| None` | Controls diversity via nucleus sampling; Anthropic deprecates this for current Claude models. |
+| `top_k` | `int \| None` | Only sample from the top K options for each subsequent token; Anthropic deprecates this for current Claude models. |
 | `stream` | `bool \| None` | Whether to stream the response |
 | `stop_sequences` | `list[str] \| None` | Custom text sequences that will cause the model to stop generating |
 | `tools` | `list[dict[str, Any]] \| None` | List of tools in Anthropic format ({name, description, input_schema}) |
@@ -83,6 +83,7 @@ Normalized parameters for the Anthropic Messages API, used internally to pass st
 | `cache_control` | `dict[str, Any] \| None` | Cache control configuration for prompt caching |
 | `prompt_cache_key` | `str \| None` | A key to use when reading from or writing to a provider's prompt cache. |
 | `service_tier` | `str \| None` | The service tier to use for this request. |
+| `container` | `str \| dict[str, Any] \| None` | Container identifier, or an object with optional ``id`` and ``skills``. A string reuses an existing container. An object selects Skills for a fresh container (``skills`` without ``id``) or reuses a container while attaching Skills (``id`` plus ``skills``). Each skill requires ``type`` (``anthropic`` or ``custom``) and ``skill_id``; ``version`` is optional. This matches Anthropic SDK ``MessageCreateParamsContainerParam`` (``str | ContainerParams``) on the pinned ``anthropic>=0.124`` Messages contract. ``messages.create`` accepts the object on the GA path; any-llm does not infer a skills beta header. Tenant ownership, authorization, persistence, and cleanup remain application responsibilities. |
 | `context_management` | `dict[str, Any] \| None` | Anthropic context management configuration |
 | `betas` | `list[str] \| None` | Anthropic beta identifiers |
 | `output_format` | `type \| dict[str, Any] \| None` |  |

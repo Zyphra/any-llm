@@ -29,11 +29,17 @@ A Pydantic `BaseModel` containing provider information and feature flags.
 | `class_name` | `str` |  |
 | `list_models` | `bool` |  |
 | `messages` | `bool` |  |
+| `messages_native` | `bool` |  |
 | `batch_completion` | `bool` |  |
 | `image_generation` | `bool` |  |
+| `image_edit` | `bool` |  |
 | `audio_transcription` | `bool` |  |
 | `audio_speech` | `bool` |  |
 | `rerank` | `bool` |  |
+| `decide` | `bool` | Whether the provider implements the decide API (`decide`/`adecide`). |
+| `video_generation` | `bool` | Whether the provider implements the video API (`video_generation`/`retrieve_video`). |
+| `files` | `bool` |  |
+| `file_operations` | `tuple[Literal['upload', 'list', 'retrieve', 'download', 'delete'], ...]` |  |
 
 ## Usage
 
