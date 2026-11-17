@@ -33,7 +33,7 @@ from any_llm.types.completion import (
     Reasoning,
 )
 from any_llm.types.model import Model
-from any_llm.utils.messages_compat import sampling_params_in_extra_body
+from any_llm.utils.messages_compat import ANTHROPIC_SAMPLING_PARAMS, sampling_params_in_extra_body
 from any_llm.utils.structured_output import get_json_schema, is_structured_output_type
 
 DEFAULT_MAX_TOKENS = 8192
@@ -88,6 +88,21 @@ _MIN_THINKING_BUDGET = 1024
 # Of the budget-thinking models, only Opus 4.5 also takes `effort`, and only up to `high`.
 _BUDGET_THINKING_EFFORT_MODEL_PREFIX = "claude-opus-4-5"
 _BUDGET_THINKING_EFFORTS = ("low", "medium", "high")
+# Claude models from Opus 4.7 on reject `temperature`, `top_p` and `top_k` with a 400, so the
+# sampling hints of an OpenAI-style completion are dropped for them. Prefixes are matched, so
+# "claude-opus-5" also covers Opus 5.5.
+_NO_SAMPLING_PARAMS_MODEL_PREFIXES = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
+    "claude-fable-",
+)
+# Models that reject `thinking: {"type": "disabled"}`: Sonnet 5.5 turns thinking off with
+# `between_tools`, while Opus 5.5 and Fable always think, so "none" runs them at the lowest effort.
+_BETWEEN_TOOLS_THINKING_OFF_MODEL_PREFIXES = ("claude-sonnet-5-5",)
+_ALWAYS_THINKING_MODEL_PREFIXES = ("claude-opus-5-5", "claude-fable-")
 
 _JSON_SCHEMA_MAPPING_KEYWORDS = frozenset(
     {
@@ -727,8 +742,16 @@ def _convert_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
     if params.tool_choice is not None or params.parallel_tool_calls is not None:
         params.tool_choice = _convert_tool_choice(params)
 
+    model_id = params.model_id.lower()
     if params.reasoning_effort is None or params.reasoning_effort == "none":
-        result_kwargs["thinking"] = {"type": "disabled"}
+        if model_id.startswith(_BETWEEN_TOOLS_THINKING_OFF_MODEL_PREFIXES):
+            result_kwargs["thinking"] = {"type": "between_tools"}
+        elif model_id.startswith(_ALWAYS_THINKING_MODEL_PREFIXES):
+            output_config = result_kwargs.get("output_config", {}).copy()
+            output_config["effort"] = "low"
+            result_kwargs["output_config"] = output_config
+        else:
+            result_kwargs["thinking"] = {"type": "disabled"}
     elif params.reasoning_effort != "auto" and _uses_budget_thinking(params.model_id):
         # The budget counts toward max_tokens, so cap it to leave room for the answer.
         budget = min(
@@ -773,6 +796,9 @@ def _convert_params(params: CompletionParams, **kwargs: Any) -> dict[str, Any]:
         )
     )
     result_kwargs["model"] = params.model_id
+    if model_id.startswith(_NO_SAMPLING_PARAMS_MODEL_PREFIXES):
+        for key in ANTHROPIC_SAMPLING_PARAMS:
+            result_kwargs.pop(key, None)
 
     if "stop" in result_kwargs:
         stop = result_kwargs.pop("stop")

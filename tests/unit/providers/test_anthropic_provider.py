@@ -450,6 +450,59 @@ async def test_completion_with_custom_reasoning_effort(reasoning_effort: Reasoni
 
 
 @pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-sonnet-4-6", {"thinking": {"type": "disabled"}}),
+        ("claude-sonnet-5-5", {"thinking": {"type": "between_tools"}}),
+        ("claude-opus-5-5", {"output_config": {"effort": "low"}}),
+        ("claude-fable-5-2", {"output_config": {"effort": "low"}}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reasoning_effort_none_turns_thinking_off_as_each_model_accepts(
+    model: str, expected: dict[str, Any]
+) -> None:
+    with mock_anthropic_provider() as mock_anthropic:
+        provider = AnthropicProvider(api_key="test-api-key")
+        await provider._acompletion(
+            CompletionParams(model_id=model, messages=[{"role": "user", "content": "Hello"}], reasoning_effort="none")
+        )
+
+        call_kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert {key: call_kwargs[key] for key in ("thinking", "output_config") if key in call_kwargs} == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_extra_body"),
+    [
+        ("claude-sonnet-4-6", {"temperature": 0.0, "top_p": 0.9}),
+        ("claude-opus-4-7", None),
+        ("claude-sonnet-5-5", None),
+        ("claude-haiku-5-5", None),
+        ("claude-fable-5-2", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sampling_params_are_dropped_for_models_that_reject_them(
+    model: str, expected_extra_body: dict[str, float] | None
+) -> None:
+    with mock_anthropic_provider() as mock_anthropic:
+        provider = AnthropicProvider(api_key="test-api-key")
+        await provider._acompletion(
+            CompletionParams(
+                model_id=model,
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=100,
+                temperature=0.0,
+                top_p=0.9,
+            )
+        )
+
+        call_kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert call_kwargs.get("extra_body") == expected_extra_body
+
+
+@pytest.mark.parametrize(
     ("reasoning_effort", "expected_effort"),
     [
         ("minimal", "low"),
